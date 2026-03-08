@@ -331,8 +331,8 @@ let bot = null;
 if (BOT_TOKEN) {
   bot = new Telegraf(BOT_TOKEN);
 
-  const CHANNEL_USERNAME = 'pitesansharkyamal_bot'; // channel username without @
-  const CHANNEL_LINK = 'https://t.me/pitesansharkyamal_bot';
+  const CHANNEL_USERNAME = 'EzMoneyPayy'; // channel username without @
+  const CHANNEL_LINK = 'https://t.me/EzMoneyPayy';
 
   async function isChannelMember(userId) {
     try {
