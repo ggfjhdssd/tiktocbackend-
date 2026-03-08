@@ -469,6 +469,25 @@ if (BOT_TOKEN) {
     try { await ctx.answerCbQuery(); await ctx.deleteMessage(); } catch(e){}
   });
 
+  // ===== /admin command =====
+  bot.command('admin', async (ctx) => {
+    try {
+      const id = ctx.from.id;
+      if (!ADMIN_ID || id !== ADMIN_ID) {
+        return ctx.reply('🚫 Admin အကောင့်မဟုတ်ပါ။');
+      }
+      await ctx.reply(
+        `🛡️ <b>Admin Panel</b>\n\nမင်္ဂလာပါ Admin!\n\nAdmin Panel သို့ဝင်ရောက်ရန် ↓`,
+        {
+          parse_mode: 'HTML',
+          ...Markup.inlineKeyboard([
+            [Markup.button.webApp('🛡️ Admin Panel ဝင်ရန်', `${FRONTEND_URL}/admin.html`)],
+          ])
+        }
+      );
+    } catch(e) { console.error('admin cmd err:', e); }
+  });
+
   bot.launch().then(()=>console.log('✅ Bot launched')).catch(e=>console.error('Bot err:',e));
 }
 
@@ -891,6 +910,24 @@ app.post('/api/withdraw', async(req,res)=>{
       {parse_mode:'Markdown'}).catch(()=>{});
     res.json({success:true,withdrawalId:wd._id,newBalance:u.balance});
   } catch(e){ console.error('withdraw err:',e); res.status(500).json({error:'Server error'}); }
+});
+
+app.get('/api/referrals/:telegramId', async(req,res)=>{
+  try {
+    const tid = parseInt(req.params.telegramId);
+    if (isNaN(tid)) return res.status(400).json({error:'Invalid ID'});
+    const referrals = await User.find({ referredBy: tid })
+      .select('firstName username balance createdAt')
+      .sort({ createdAt: -1 })
+      .lean();
+    const list = referrals.map(u => ({
+      name: u.firstName || u.username || `User${u.telegramId}`,
+      username: u.username || '',
+      balance: u.balance || 0,
+      joinedAt: u.createdAt
+    }));
+    res.json({ total: list.length, referrals: list });
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 // ===== Admin Routes =====
