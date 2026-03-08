@@ -1,994 +1,1081 @@
 const express = require('express');
-const { Telegraf } = require('telegraf');
+const { Telegraf, Markup } = require('telegraf');
 const { Server } = require('socket.io');
 const http = require('http');
 const mongoose = require('mongoose');
-const dotenv = require('dotenv');
-
-dotenv.config();
+const crypto = require('crypto');
+const https = require('https');
+require('dotenv').config();
 
 const app = express();
 const server = http.createServer(app);
 
-// ==================== CORS ====================
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+  res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type,Authorization,x-admin-id');
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
-
 app.use(express.json());
 
-// ==================== Socket.io ====================
 const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] },
   allowEIO3: true,
-  transports: ['websocket', 'polling']
+  pingTimeout: 30000,
+  pingInterval: 10000
 });
 
-// ==================== Env Validation ====================
-const BOT_TOKEN = process.env.BOT_TOKEN;
-const ADMIN_ID = process.env.ADMIN_ID ? parseInt(process.env.ADMIN_ID) : null;
-const MONGODB_URI1 = process.env.MONGODB_URI1;
-const MONGODB_URI2 = process.env.MONGODB_URI2;
+const BOT_TOKEN     = process.env.BOT_TOKEN;
+const ADMIN_ID      = process.env.ADMIN_ID ? parseInt(process.env.ADMIN_ID) : null;
+const FRONTEND_URL  = process.env.FRONTEND_URL  || 'https://tictokfrontend.vercel.app';
+const BACKEND_URL   = process.env.BACKEND_URL   || 'https://tiktocbackend.onrender.com';
+const BOT_USERNAME  = process.env.BOT_USERNAME  || 'tictoe1_bot';
 
-if (!BOT_TOKEN || !ADMIN_ID || !MONGODB_URI1) {
-  console.error('❌ Missing required environment variables');
-  process.exit(1);
-}
+const ENTRY_FEE       = 1000;
+const WIN_PRIZE       = 1600;
+const DRAW_REFUND     = 500;
+const TURN_SECONDS    = 10;   // 10 seconds per turn
+const SEARCH_TIMEOUT_S = 30;
 
-// ==================== MongoDB ====================
+// ===== MongoDB =====
 let isConnected = false;
-
-const connectDB = async () => {
-  const uris = [MONGODB_URI1, MONGODB_URI2].filter(Boolean);
+async function connectDB() {
+  const uris = [process.env.MONGODB_URI1, process.env.MONGODB_URI2].filter(Boolean);
   for (const uri of uris) {
     try {
-      if (mongoose.connection.readyState !== 0) await mongoose.disconnect();
-      await mongoose.connect(uri, {
-        serverSelectionTimeoutMS: 10000,
-        socketTimeoutMS: 45000,
-      });
+      await mongoose.connect(uri, { serverSelectionTimeoutMS: 10000 });
       isConnected = true;
       console.log('✅ MongoDB connected');
       return;
     } catch (e) {
-      console.error('❌ MongoDB connect failed:', e.message);
+      console.error('❌ MongoDB failed:', e.message);
     }
   }
-  console.error('❌ All MongoDB URIs failed, retrying in 10s...');
   setTimeout(connectDB, 10000);
-};
-
+}
 mongoose.connection.on('disconnected', () => { isConnected = false; });
-mongoose.connection.on('reconnected', () => { isConnected = true; });
-
+mongoose.connection.on('reconnected',  () => { isConnected = true;  });
 connectDB();
 
-// ==================== Schemas ====================
+// ===== Schemas =====
 const userSchema = new mongoose.Schema({
-  telegramId: { type: Number, required: true, unique: true },
-  username: String,
-  firstName: String,
-  balance: { type: Number, default: 0 },
-  referredBy: { type: Number, default: null },
-  referralCode: { type: String, unique: true },
-  createdAt: { type: Date, default: Date.now },
-  totalGames: { type: Number, default: 0 },
-  wins: { type: Number, default: 0 },
-  losses: { type: Number, default: 0 }
+  telegramId:   { type: Number, required: true, unique: true },
+  username:     { type: String, default: '' },
+  firstName:    { type: String, default: '' },
+  balance:      { type: Number, default: 0 },
+  referredBy:   { type: Number, default: null },
+  referralCode: { type: String, unique: true, sparse: true },
+  totalGames:   { type: Number, default: 0 },
+  wins:         { type: Number, default: 0 },
+  losses:       { type: Number, default: 0 },
+  isBanned:     { type: Boolean, default: false },
+  createdAt:    { type: Date, default: Date.now }
 });
+userSchema.index({ telegramId: 1 });
+userSchema.index({ referralCode: 1 });
 
 const depositSchema = new mongoose.Schema({
-  userId: { type: Number, required: true },
-  kpayName: String,
+  userId:        { type: Number, required: true },
+  kpayName:      String,
   transactionId: { type: String, required: true, unique: true },
-  amount: { type: Number, required: true },
-  status: { type: String, enum: ['pending', 'confirmed', 'rejected'], default: 'pending' },
-  createdAt: { type: Date, default: Date.now },
-  confirmedAt: Date
+  amount:        { type: Number, required: true },
+  status:        { type: String, enum: ['pending', 'confirmed', 'rejected'], default: 'pending' },
+  createdAt:     { type: Date, default: Date.now },
+  processedAt:   Date
 });
+depositSchema.index({ transactionId: 1 });
+depositSchema.index({ status: 1 });
 
 const withdrawalSchema = new mongoose.Schema({
-  userId: { type: Number, required: true },
-  kpayName: String,
-  kpayNumber: String,
-  amount: { type: Number, required: true },
-  status: { type: String, enum: ['pending', 'confirmed', 'rejected'], default: 'pending' },
-  createdAt: { type: Date, default: Date.now },
-  confirmedAt: Date
+  userId:      { type: Number, required: true },
+  kpayName:    String,
+  kpayNumber:  String,
+  amount:      { type: Number, required: true },
+  status:      { type: String, enum: ['pending', 'confirmed', 'rejected'], default: 'pending' },
+  createdAt:   { type: Date, default: Date.now },
+  processedAt: Date
 });
+withdrawalSchema.index({ status: 1 });
 
 const gameSchema = new mongoose.Schema({
-  gameId: { type: String, required: true, unique: true },
-  players: [{ type: Number }],
-  board: { type: mongoose.Schema.Types.Mixed, default: () => Array(5).fill(null).map(() => Array(5).fill('')) },
-  currentTurn: { type: Number, default: null },
-  gameStartTime: { type: Date, default: Date.now },
-  turnStartTime: { type: Date, default: Date.now },
-  winner: { type: Number, default: null },
-  status: { type: String, enum: ['waiting', 'active', 'completed'], default: 'waiting' },
-  isBotGame: { type: Boolean, default: false }
+  gameId:   { type: String, required: true, unique: true },
+  players:  [Number],
+  symbols:  { type: Map, of: String },
+  board:    { type: [[String]], default: () => Array(5).fill(null).map(() => Array(5).fill('')) },
+  winner:   { type: mongoose.Schema.Types.Mixed, default: null },
+  status:   { type: String, enum: ['waiting', 'active', 'completed'], default: 'waiting' },
+  createdAt:{ type: Date, default: Date.now, expires: 86400 }  // TTL: auto-delete after 24h
+});
+gameSchema.index({ gameId: 1 });
+
+const settingsSchema = new mongoose.Schema({
+  key:   { type: String, unique: true },
+  value: mongoose.Schema.Types.Mixed
 });
 
-const User = mongoose.model('User', userSchema);
-const Deposit = mongoose.model('Deposit', depositSchema);
+const User       = mongoose.model('User',       userSchema);
+const Deposit    = mongoose.model('Deposit',    depositSchema);
 const Withdrawal = mongoose.model('Withdrawal', withdrawalSchema);
-const Game = mongoose.model('Game', gameSchema);
+const Game       = mongoose.model('Game',       gameSchema);
+const Settings   = mongoose.model('Settings',   settingsSchema);
 
-// ==================== Helpers ====================
-function generateReferralCode(telegramId) {
-  return 'TIC' + telegramId.toString(36).toUpperCase() + Math.random().toString(36).substr(2, 4).toUpperCase();
+// ===== In-Memory =====
+const waitingQueue       = [];
+const activeGames        = new Map();
+const gameTurnTimeouts   = new Map();
+const userSockets        = new Map();
+const searchNotifications = new Map();
+
+// ===== Helpers =====
+function genRefCode(id) {
+  return 'TIC' + id.toString(36).toUpperCase() + Math.random().toString(36).substr(2, 4).toUpperCase();
+}
+function genGameId() {
+  return 'g' + Date.now() + Math.random().toString(36).substr(2, 5);
 }
 
-// FIX: Accept initData OR direct telegramId for dev/testing fallback
-function validateInitData(initData) {
-  if (!initData) return null;
+function verifyTgAuth(initData) {
+  if (!initData || !BOT_TOKEN) return null;
   try {
-    // Standard Telegram initData format
-    const urlParams = new URLSearchParams(initData);
-    const userStr = urlParams.get('user');
-    if (userStr) {
-      return JSON.parse(userStr);
-    }
-    // Fallback: try parsing as direct JSON (for testing)
-    return JSON.parse(initData);
-  } catch (e) {
-    return null;
-  }
+    const p = new URLSearchParams(initData);
+    const hash = p.get('hash');
+    if (!hash) return null;
+    const check = Array.from(p.entries())
+      .filter(([k]) => k !== 'hash')
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([k, v]) => `${k}=${v}`).join('\n');
+    const secret = crypto.createHmac('sha256', 'WebAppData').update(BOT_TOKEN).digest();
+    const hmac   = crypto.createHmac('sha256', secret).update(check).digest('hex');
+    if (hmac !== hash) return null;
+    const u = p.get('user');
+    return u ? JSON.parse(u) : null;
+  } catch { return null; }
 }
 
-function generateGameId() {
-  return 'game_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+function checkWin(board, sym) {
+  const dirs = [[0,1],[1,0],[1,1],[1,-1]];
+  for (let r = 0; r < 5; r++) {
+    for (let c = 0; c < 5; c++) {
+      if (board[r][c] !== sym) continue;
+      for (const [dr, dc] of dirs) {
+        let cnt = 1;
+        for (let i = 1; i < 4; i++) {
+          const nr = r + dr*i, nc = c + dc*i;
+          if (nr < 0 || nr >= 5 || nc < 0 || nc >= 5 || board[nr][nc] !== sym) break;
+          cnt++;
+        }
+        if (cnt >= 4) return true;
+      }
+    }
+  }
+  return false;
 }
 
-// ==================== AI (Heuristic - fast) ====================
-class TicTacToeAI {
-  checkWin(board, symbol) {
-    for (let i = 0; i < 5; i++) {
-      for (let j = 0; j <= 1; j++) {
-        if (board[i][j] === symbol && board[i][j+1] === symbol && board[i][j+2] === symbol && board[i][j+3] === symbol) return true;
-      }
-    }
-    for (let i = 0; i <= 1; i++) {
-      for (let j = 0; j < 5; j++) {
-        if (board[i][j] === symbol && board[i+1][j] === symbol && board[i+2][j] === symbol && board[i+3][j] === symbol) return true;
-      }
-    }
-    for (let i = 0; i <= 1; i++) {
-      for (let j = 0; j <= 1; j++) {
-        if (board[i][j] === symbol && board[i+1][j+1] === symbol && board[i+2][j+2] === symbol && board[i+3][j+3] === symbol) return true;
-      }
-    }
-    for (let i = 0; i <= 1; i++) {
-      for (let j = 3; j < 5; j++) {
-        if (board[i][j] === symbol && board[i+1][j-1] === symbol && board[i+2][j-2] === symbol && board[i+3][j-3] === symbol) return true;
-      }
-    }
-    return false;
-  }
-
-  scoreCell(board, row, col, symbol) {
-    let score = 0;
-    const dirs = [[0,1],[1,0],[1,1],[1,-1]];
-    for (const [dr, dc] of dirs) {
-      let count = 1, blocked = 0;
-      for (let k = 1; k < 4; k++) {
-        const r = row + dr*k, c = col + dc*k;
-        if (r < 0 || r >= 5 || c < 0 || c >= 5) { blocked++; break; }
-        if (board[r][c] === symbol) count++;
-        else if (board[r][c] !== '') { blocked++; break; }
-        else break;
-      }
-      for (let k = 1; k < 4; k++) {
-        const r = row - dr*k, c = col - dc*k;
-        if (r < 0 || r >= 5 || c < 0 || c >= 5) { blocked++; break; }
-        if (board[r][c] === symbol) count++;
-        else if (board[r][c] !== '') { blocked++; break; }
-        else break;
-      }
-      if (count >= 4) score += 10000;
-      else if (count === 3 && blocked === 0) score += 500;
-      else if (count === 3) score += 100;
-      else if (count === 2 && blocked === 0) score += 50;
-    }
-    return score;
-  }
-
-  getBestMove(board, currentPlayer) {
-    const opponent = currentPlayer === 'X' ? 'O' : 'X';
-    let best = -1, bestMove = null;
-    const empty = [];
-    for (let i = 0; i < 5; i++)
-      for (let j = 0; j < 5; j++)
-        if (board[i][j] === '') empty.push([i, j]);
-    
-    if (empty.length === 25) return [2, 2]; // Start center
-    
-    for (const [r, c] of empty) {
-      board[r][c] = currentPlayer;
-      const attackScore = this.scoreCell(board, r, c, currentPlayer);
-      board[r][c] = '';
-      board[r][c] = opponent;
-      const defenseScore = this.scoreCell(board, r, c, opponent);
-      board[r][c] = '';
-      const score = Math.max(attackScore, defenseScore * 0.9);
-      if (score > best) { best = score; bestMove = [r, c]; }
-    }
-    return bestMove || empty[Math.floor(Math.random() * empty.length)];
-  }
+function boardFull(board) {
+  return board.every(row => row.every(cell => cell !== ''));
 }
 
-const ai = new TicTacToeAI();
+async function getSetting(key, def) {
+  try {
+    const s = await Settings.findOne({ key }).lean();
+    return s ? s.value : def;
+  } catch { return def; }
+}
 
-// ==================== Bot ====================
-let bot;
-try {
+async function setSetting(key, value) {
+  await Settings.findOneAndUpdate({ key }, { value }, { upsert: true });
+}
+
+// ===== Bot =====
+let bot = null;
+if (BOT_TOKEN) {
   bot = new Telegraf(BOT_TOKEN);
 
   bot.start(async (ctx) => {
-    const userId = ctx.from.id;
+    const id   = ctx.from.id;
     const args = ctx.payload;
     try {
-      let user = await User.findOne({ telegramId: userId });
+      let user = await User.findOne({ telegramId: id });
       if (!user) {
         user = new User({
-          telegramId: userId,
-          username: ctx.from.username || '',
-          firstName: ctx.from.first_name || '',
-          referralCode: generateReferralCode(userId)
+          telegramId:   id,
+          username:     ctx.from.username  || '',
+          firstName:    ctx.from.first_name || '',
+          referralCode: genRefCode(id)
         });
-        if (args) {
-          const referrer = await User.findOne({ referralCode: args });
-          if (referrer && referrer.telegramId !== userId) {
-            user.referredBy = referrer.telegramId;
-          }
+        if (args && args.length > 3) {
+          const ref = await User.findOne({ referralCode: args }).lean();
+          if (ref && ref.telegramId !== id) user.referredBy = ref.telegramId;
         }
         await user.save();
       }
-      const webAppUrl = 'https://tictokfrontend.vercel.app';
-      ctx.reply(`🎮 မင်္ဂလာပါ ${ctx.from.first_name}!\n\n💰 လက်ကျန်: ${user.balance} MMK\n\nကစားရန် PLAY ကိုနှိပ်ပါ 👇`, {
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: '🎮 PLAY GAME', web_app: { url: webAppUrl } }],
-            [{ text: '💰 Balance', callback_data: 'balance' }, { text: '🔗 Referral', callback_data: 'referral' }]
-          ]
-        }
-      });
-    } catch (error) {
-      console.error('Bot start error:', error);
-      ctx.reply('⚠️ ဝန်ဆောင်မှု ယာယီရပ်နားနေပါသည်။ ခဏနေ ပြန်ကြိုးစားပါ။');
+
+      const maint = await getSetting('maintenance', false);
+      if (maint && id !== ADMIN_ID) {
+        return ctx.reply('🔧 ဆာဗာ ပြင်ဆင်နေသောကြောင့် ယာယီပိတ်ထားပါသည်။');
+      }
+
+      await ctx.reply(
+        `🎮 မင်္ဂလာပါ ${ctx.from.first_name}!\n\n💰 လက်ကျန်: ${user.balance.toLocaleString()} MMK\n🏆 နိုင်: ${user.wins}  •  ❌ ရှုံး: ${user.losses}`,
+        Markup.inlineKeyboard([
+          [Markup.button.webApp('🎮 PLAY NOW', FRONTEND_URL)],
+          [Markup.button.callback('💰 Balance', 'bal'), Markup.button.callback('🔗 Referral', 'ref')]
+        ])
+      );
+    } catch (e) {
+      console.error(e);
+      ctx.reply('⚠️ ဆာဗာ ချိတ်ဆက်မှု ပြဿနာ');
     }
   });
 
-  bot.action('referral', async (ctx) => {
+  bot.action('bal', async (ctx) => {
     try {
-      const user = await User.findOne({ telegramId: ctx.from.id });
-      if (user) {
-        const botUsername = ctx.botInfo?.username || 'tictoe1_bot';
-        await ctx.answerCbQuery();
-        ctx.reply(`🔗 သင့် Referral Link:\nhttps://t.me/${botUsername}?start=${user.referralCode}\n\nမိတ်ဆွေတစ်ဦး 1000 MMK ဖြည့်တိုင်း 100 MMK ရမည်!`);
-      }
-    } catch (e) { ctx.answerCbQuery(); }
+      await ctx.answerCbQuery();
+      const u = await User.findOne({ telegramId: ctx.from.id }).lean();
+      if (!u) return;
+      ctx.reply(
+        `💰 လက်ကျန်: ${u.balance.toLocaleString()} MMK\n🎮 ကစားမှု: ${u.totalGames}\n🏆 နိုင်: ${u.wins}  •  ❌ ရှုံး: ${u.losses}`,
+        Markup.inlineKeyboard([[Markup.button.webApp('🎮 ကစားမည်', FRONTEND_URL)]])
+      );
+    } catch (e) {}
   });
 
-  bot.action('balance', async (ctx) => {
+  bot.action('ref', async (ctx) => {
     try {
-      const user = await User.findOne({ telegramId: ctx.from.id });
-      if (user) {
-        await ctx.answerCbQuery();
-        ctx.reply(`💰 လက်ကျန်ငွေ: ${user.balance} MMK\n🎮 ကစားမှုအရေအတွက်: ${user.totalGames}\n🏆 နိုင်မှု: ${user.wins} | ရှုံးမှု: ${user.losses}`);
-      }
-    } catch (e) { ctx.answerCbQuery(); }
-  });
-
-  bot.command('admin', (ctx) => {
-    if (ctx.from.id === ADMIN_ID) {
-      ctx.reply('👑 Admin Panel', {
-        reply_markup: {
-          inline_keyboard: [[{ text: '⚙️ Admin Panel', web_app: { url: 'https://tictokfrontend.vercel.app/admin.html' } }]]
+      await ctx.answerCbQuery();
+      const u = await User.findOne({ telegramId: ctx.from.id }).lean();
+      if (!u) return;
+      const link = `https://t.me/${BOT_USERNAME}?start=${u.referralCode}`;
+      ctx.reply(
+        `🔗 <b>Referral Link</b>\n\nသူငယ်ချင်း တစ်ယောက်မှ 1,000 MMK ဖြည့်တိုင်း သင် <b>100 MMK</b> ရမည်!\n\n<code>${link}</code>`,
+        {
+          parse_mode: 'HTML',
+          ...Markup.inlineKeyboard([[
+            Markup.button.url('📤 Share', `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent('🎮 TicToeTic ကစားပြီးငွေရှာကြစို့!')}`)
+          ]])
         }
-      });
-    } else {
-      ctx.reply('⛔ ခွင့်ပြုချက်မရှိပါ။');
+      );
+    } catch (e) {}
+  });
+
+  // Join action from broadcast notification
+  bot.action(/^join_(.+)$/, async (ctx) => {
+    try {
+      await ctx.answerCbQuery('ချိတ်ဆက်နေပါသည်...');
+      const gameId = ctx.match[1];
+      const id     = ctx.from.id;
+
+      // Delete the notification message immediately
+      try { await ctx.deleteMessage(); } catch (e) {}
+
+      const user = await User.findOne({ telegramId: id }).lean();
+      if (!user) return ctx.reply('ဦးစွာ /start နှိပ်ပါ');
+
+      if (user.balance < ENTRY_FEE) {
+        return ctx.reply(
+          `⚠️ ငွေမလုံလောက်ပါ!\n\nပွဲဝင်ကြေး: ${ENTRY_FEE.toLocaleString()} MMK\nသင့်ကျန်: ${user.balance.toLocaleString()} MMK`,
+          Markup.inlineKeyboard([[Markup.button.webApp('💰 ငွေဖြည့်ရန်', FRONTEND_URL)]])
+        );
+      }
+
+      await ctx.reply(
+        '✅ ပွဲတွင် ဝင်ရောက်ရန် PLAY ကိုနှိပ်ပါ',
+        Markup.inlineKeyboard([[Markup.button.webApp('🎮 JOIN NOW', `${FRONTEND_URL}/play.html?join=${gameId}`)]])
+      );
+    } catch (e) {
+      console.error('join action err:', e);
     }
   });
 
-  bot.launch().then(() => console.log('✅ Bot started')).catch(err => console.error('❌ Bot failed:', err));
-} catch (e) {
-  console.error('Bot init error:', e);
+  bot.action('dismiss', async (ctx) => {
+    try {
+      await ctx.answerCbQuery();
+      await ctx.deleteMessage();
+    } catch (e) {}
+  });
+
+  bot.launch()
+    .then(() => console.log('✅ Bot launched'))
+    .catch(e => console.error('Bot err:', e));
 }
 
-// ==================== API Routes ====================
-app.get('/', (req, res) => res.json({ status: 'ok', message: 'TicToeTic Backend', time: new Date() }));
-
-app.get('/health', (req, res) => res.json({
-  status: 'ok',
-  mongodb: isConnected ? 'connected' : 'disconnected',
-  uptime: process.uptime()
-}));
-
-// AUTH - FIX: Better error handling + dev mode fallback
-app.post('/api/auth', async (req, res) => {
+// ===== Notify All Users When Someone Searches for a Game =====
+async function notifyUsersGameSearch(searcherId, gameId) {
+  if (!bot) return;
   try {
-    const { initData, telegramId: directId } = req.body;
-    
-    let telegramId, username, firstName;
-    
-    if (directId) {
-      // Dev mode / direct ID
-      telegramId = parseInt(directId);
-      username = 'User' + telegramId;
-      firstName = 'User';
-    } else {
-      const userData = validateInitData(initData);
-      if (!userData) {
-        return res.status(401).json({ error: 'Invalid Telegram auth data. Please open from Telegram.' });
-      }
-      telegramId = userData.id;
-      username = userData.username || '';
-      firstName = userData.first_name || '';
-    }
+    const searcher = await User.findOne({ telegramId: searcherId }).select('firstName username').lean();
+    const name     = searcher?.firstName || searcher?.username || 'တစ်ယောက်';
 
-    let user = await User.findOne({ telegramId });
-    if (!user) {
-      user = new User({
-        telegramId,
-        username,
-        firstName,
-        referralCode: generateReferralCode(telegramId)
-      });
-      await user.save();
-    } else {
-      let changed = false;
-      if (username && user.username !== username) { user.username = username; changed = true; }
-      if (firstName && user.firstName !== firstName) { user.firstName = firstName; changed = true; }
-      if (changed) await user.save();
-    }
+    const users = await User.find({ telegramId: { $ne: searcherId }, isBanned: false })
+      .select('telegramId').lean().limit(200);
 
-    res.json({
-      telegramId: user.telegramId,
-      username: user.username || user.firstName || 'User',
-      firstName: user.firstName,
-      balance: user.balance,
-      referralCode: user.referralCode,
-      totalGames: user.totalGames,
-      wins: user.wins,
-      losses: user.losses
-    });
-  } catch (error) {
-    console.error('Auth error:', error);
-    res.status(500).json({ error: 'Server error: ' + error.message });
-  }
-});
-
-app.get('/api/user/:telegramId', async (req, res) => {
-  try {
-    const user = await User.findOne({ telegramId: parseInt(req.params.telegramId) });
-    if (!user) return res.status(404).json({ error: 'User not found' });
-    res.json({ balance: user.balance, totalGames: user.totalGames, wins: user.wins, losses: user.losses });
-  } catch (error) {
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-app.post('/api/deposit', async (req, res) => {
-  try {
-    const { telegramId, kpayName, transactionId, amount } = req.body;
-    if (!telegramId || !kpayName || !transactionId || !amount) {
-      return res.status(400).json({ error: 'ကွင်းအားလုံး ဖြည့်ပါ' });
-    }
-    if (amount < 1000) return res.status(400).json({ error: 'အနည်းဆုံး 1000 MMK လိုပါသည်' });
-
-    const user = await User.findOne({ telegramId: parseInt(telegramId) });
-    if (!user) return res.status(404).json({ error: 'User not found' });
-
-    const existing = await Deposit.findOne({ transactionId });
-    if (existing) return res.status(400).json({ error: 'Transaction ID ကိုအသုံးပြုပြီးပါပြီ' });
-
-    const deposit = new Deposit({ userId: user.telegramId, kpayName, transactionId, amount });
-    await deposit.save();
-
-    try {
-      await bot.telegram.sendMessage(ADMIN_ID,
-        `💰 *ငွေသွင်း တောင်းဆိုမှု*\n\nUser: ${user.username || user.firstName || 'N/A'} (${user.telegramId})\nပမာဏ: ${amount} MMK\nKPay Name: ${kpayName}\nTransaction ID: \`${transactionId}\``,
-        { parse_mode: 'Markdown' }
-      );
-    } catch (e) { console.error('Bot notify error:', e.message); }
-
-    res.json({ success: true, depositId: deposit._id });
-  } catch (error) {
-    console.error('Deposit error:', error);
-    res.status(500).json({ error: 'Server error: ' + error.message });
-  }
-});
-
-app.post('/api/withdraw', async (req, res) => {
-  try {
-    const { telegramId, kpayName, kpayNumber, amount } = req.body;
-    if (!telegramId || !kpayName || !kpayNumber || !amount) {
-      return res.status(400).json({ error: 'ကွင်းအားလုံး ဖြည့်ပါ' });
-    }
-    if (amount < 3000) return res.status(400).json({ error: 'အနည်းဆုံး 3000 MMK မှ ထုတ်ယူနိုင်သည်' });
-
-    const user = await User.findOne({ telegramId: parseInt(telegramId) });
-    if (!user) return res.status(404).json({ error: 'User not found' });
-    if (user.balance < amount) return res.status(400).json({ error: 'လက်ကျန်ငွေ မလုံလောက်ပါ' });
-
-    const withdrawal = new Withdrawal({ userId: user.telegramId, kpayName, kpayNumber, amount });
-    await withdrawal.save();
-
-    try {
-      await bot.telegram.sendMessage(ADMIN_ID,
-        `💸 *ငွေထုတ် တောင်းဆိုမှု*\n\nUser: ${user.username || user.firstName || 'N/A'} (${user.telegramId})\nပမာဏ: ${amount} MMK\nKPay Name: ${kpayName}\nKPay Number: ${kpayNumber}`,
-        { parse_mode: 'Markdown' }
-      );
-    } catch (e) { console.error('Bot notify error:', e.message); }
-
-    res.json({ success: true, withdrawalId: withdrawal._id });
-  } catch (error) {
-    console.error('Withdrawal error:', error);
-    res.status(500).json({ error: 'Server error: ' + error.message });
-  }
-});
-
-// Admin routes
-app.get('/api/admin/pending', async (req, res) => {
-  try {
-    const { adminId } = req.query;
-    if (parseInt(adminId) !== ADMIN_ID) return res.status(403).json({ error: 'Unauthorized' });
-
-    const [deposits, withdrawals] = await Promise.all([
-      Deposit.find({ status: 'pending' }).sort({ createdAt: -1 }),
-      Withdrawal.find({ status: 'pending' }).sort({ createdAt: -1 })
-    ]);
-
-    const userIds = [...new Set([...deposits.map(d => d.userId), ...withdrawals.map(w => w.userId)])];
-    const users = await User.find({ telegramId: { $in: userIds } });
-    const userMap = users.reduce((acc, u) => ({ ...acc, [u.telegramId]: u }), {});
-
-    res.json({
-      deposits: deposits.map(d => ({ ...d.toObject(), username: userMap[d.userId]?.username || userMap[d.userId]?.firstName, userBalance: userMap[d.userId]?.balance })),
-      withdrawals: withdrawals.map(w => ({ ...w.toObject(), username: userMap[w.userId]?.username || userMap[w.userId]?.firstName, userBalance: userMap[w.userId]?.balance }))
-    });
-  } catch (error) {
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-app.get('/api/admin/stats', async (req, res) => {
-  try {
-    const { adminId } = req.query;
-    if (parseInt(adminId) !== ADMIN_ID) return res.status(403).json({ error: 'Unauthorized' });
-
-    const [totalUsers, totalGames, pendingDeposits, pendingWithdrawals, confirmedDeposits] = await Promise.all([
-      User.countDocuments(),
-      Game.countDocuments({ status: 'completed' }),
-      Deposit.countDocuments({ status: 'pending' }),
-      Withdrawal.countDocuments({ status: 'pending' }),
-      Deposit.aggregate([{ $match: { status: 'confirmed' } }, { $group: { _id: null, total: { $sum: '$amount' } } }])
-    ]);
-
-    res.json({
-      totalUsers,
-      totalGames,
-      pendingDeposits,
-      pendingWithdrawals,
-      totalDeposited: confirmedDeposits[0]?.total || 0
-    });
-  } catch (error) {
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-app.post('/api/admin/confirm-deposit', async (req, res) => {
-  try {
-    const { adminId, depositId } = req.body;
-    if (parseInt(adminId) !== ADMIN_ID) return res.status(403).json({ error: 'Unauthorized' });
-
-    const deposit = await Deposit.findById(depositId);
-    if (!deposit) return res.status(404).json({ error: 'Deposit not found' });
-    if (deposit.status !== 'pending') return res.status(400).json({ error: 'Already processed' });
-
-    deposit.status = 'confirmed';
-    deposit.confirmedAt = new Date();
-    await deposit.save();
-
-    const user = await User.findOne({ telegramId: deposit.userId });
-    if (user) {
-      user.balance += deposit.amount;
-      await user.save();
-
-      // Referral bonus
-      if (user.referredBy) {
-        const referrer = await User.findOne({ telegramId: user.referredBy });
-        if (referrer) {
-          referrer.balance += 100;
-          await referrer.save();
-          try {
-            await bot.telegram.sendMessage(referrer.telegramId,
-              `🎉 မိတ်ဆွေ @${user.username || user.telegramId} ၏ ${deposit.amount} MMK ဖြည့်မှုအတွက် Referral ကြေး 100 MMK ရပါပြီ!\nလက်ကျန်: ${referrer.balance} MMK`
-            );
-          } catch (e) {}
-        }
-      }
-
+    const sent = [];
+    for (const u of users) {
       try {
-        await bot.telegram.sendMessage(deposit.userId,
-          `✅ *ငွေသွင်း အတည်ပြုပြီး*\n\n${deposit.amount} MMK ဖြည့်ပြီးပါပြီ!\nလက်ကျန်: ${user.balance} MMK`,
-          { parse_mode: 'Markdown' }
+        const msg = await bot.telegram.sendMessage(
+          u.telegramId,
+          `⚡ <b>${name}</b> ပွဲရှာနေသည်!\n\n⏱ ${SEARCH_TIMEOUT_S} စက္ကန့်အတွင်း Join မနှိပ်ရင် ပွဲပျောက်မည်\n💰 ဝင်ကြေး: ${ENTRY_FEE.toLocaleString()} MMK  •  🏆 ဆု: ${WIN_PRIZE.toLocaleString()} MMK`,
+          {
+            parse_mode: 'HTML',
+            reply_markup: {
+              inline_keyboard: [[
+                { text: '🎮 Join Game', callback_data: `join_${gameId}` },
+                { text: '❌ မကစားဘူး',  callback_data: 'dismiss' }
+              ]]
+            }
+          }
         );
+        sent.push({ userId: u.telegramId, msgId: msg.message_id });
+        await new Promise(r => setTimeout(r, 50)); // rate-limit friendly
       } catch (e) {}
     }
 
-    res.json({ success: true });
-  } catch (error) {
-    res.status(500).json({ error: 'Server error: ' + error.message });
+    searchNotifications.set(gameId, sent);
+  } catch (e) {
+    console.error('notify err:', e);
   }
-});
-
-app.post('/api/admin/reject-deposit', async (req, res) => {
-  try {
-    const { adminId, depositId, reason } = req.body;
-    if (parseInt(adminId) !== ADMIN_ID) return res.status(403).json({ error: 'Unauthorized' });
-
-    const deposit = await Deposit.findById(depositId);
-    if (!deposit) return res.status(404).json({ error: 'Deposit not found' });
-
-    deposit.status = 'rejected';
-    await deposit.save();
-
-    try {
-      await bot.telegram.sendMessage(deposit.userId,
-        `❌ *ငွေသွင်း ငြင်းပယ်ခံရသည်*\n\n${deposit.amount} MMK ငြင်းပယ်ခံရပါသည်.\nအကြောင်းပြချက်: ${reason || 'Admin ကိုဆက်သွယ်ပါ'}`,
-        { parse_mode: 'Markdown' }
-      );
-    } catch (e) {}
-
-    res.json({ success: true });
-  } catch (error) {
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-app.post('/api/admin/confirm-withdrawal', async (req, res) => {
-  try {
-    const { adminId, withdrawalId } = req.body;
-    if (parseInt(adminId) !== ADMIN_ID) return res.status(403).json({ error: 'Unauthorized' });
-
-    const withdrawal = await Withdrawal.findById(withdrawalId);
-    if (!withdrawal) return res.status(404).json({ error: 'Withdrawal not found' });
-    if (withdrawal.status !== 'pending') return res.status(400).json({ error: 'Already processed' });
-
-    const user = await User.findOne({ telegramId: withdrawal.userId });
-    if (!user) return res.status(404).json({ error: 'User not found' });
-    if (user.balance < withdrawal.amount) return res.status(400).json({ error: 'Insufficient balance' });
-
-    user.balance -= withdrawal.amount;
-    await user.save();
-
-    withdrawal.status = 'confirmed';
-    withdrawal.confirmedAt = new Date();
-    await withdrawal.save();
-
-    try {
-      await bot.telegram.sendMessage(withdrawal.userId,
-        `✅ *ငွေထုတ် အတည်ပြုပြီး*\n\n${withdrawal.amount} MMK ပေးပို့ပြီးပါပြီ!\nKPay: ${withdrawal.kpayName} (${withdrawal.kpayNumber})\nလက်ကျန်: ${user.balance} MMK`,
-        { parse_mode: 'Markdown' }
-      );
-    } catch (e) {}
-
-    res.json({ success: true });
-  } catch (error) {
-    res.status(500).json({ error: 'Server error: ' + error.message });
-  }
-});
-
-app.post('/api/admin/reject-withdrawal', async (req, res) => {
-  try {
-    const { adminId, withdrawalId, reason } = req.body;
-    if (parseInt(adminId) !== ADMIN_ID) return res.status(403).json({ error: 'Unauthorized' });
-
-    const withdrawal = await Withdrawal.findById(withdrawalId);
-    if (!withdrawal) return res.status(404).json({ error: 'Withdrawal not found' });
-
-    withdrawal.status = 'rejected';
-    await withdrawal.save();
-
-    try {
-      await bot.telegram.sendMessage(withdrawal.userId,
-        `❌ *ငွေထုတ် ငြင်းပယ်ခံရသည်*\n\n${withdrawal.amount} MMK ငြင်းပယ်ခံရပါသည်.\nအကြောင်းပြချက်: ${reason || 'Admin ကိုဆက်သွယ်ပါ'}`,
-        { parse_mode: 'Markdown' }
-      );
-    } catch (e) {}
-
-    res.json({ success: true });
-  } catch (error) {
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// ==================== Socket.io Game Logic ====================
-const waitingQueue = []; // { socketId, userId, gameId }
-const gameTurnTimeouts = new Map();
-const activeGames = new Map(); // gameId -> { aiTimeout }
-const socketUserMap = new Map(); // socketId -> userId
-
-io.on('connection', (socket) => {
-  console.log('👤 Connected:', socket.id);
-
-  socket.on('findGame', async (data) => {
-    try {
-      // FIX: Accept userId from socket auth OR from event data
-      const userId = parseInt(socket.handshake.auth?.token || data?.userId);
-      if (!userId) {
-        socket.emit('error', { message: 'Authentication required' });
-        return;
-      }
-
-      socketUserMap.set(socket.id, userId);
-
-      const user = await User.findOne({ telegramId: userId });
-      if (!user) {
-        socket.emit('error', { message: 'User not found' });
-        return;
-      }
-      if (user.balance < 1000) {
-        socket.emit('error', { message: 'လက်ကျန်ငွေ မလုံလောက်ပါ (1000 MMK လိုအပ်သည်)' });
-        return;
-      }
-
-      // Deduct entry fee
-      user.balance -= 1000;
-      user.totalGames += 1;
-      await user.save();
-
-      // FIX: Check waiting queue for opponent
-      const waitingPlayer = waitingQueue.find(p => p.userId !== userId);
-      
-      if (waitingPlayer) {
-        // Found opponent - start game
-        const idx = waitingQueue.indexOf(waitingPlayer);
-        waitingQueue.splice(idx, 1);
-        
-        const gameId = generateGameId();
-        const game = new Game({
-          gameId,
-          players: [waitingPlayer.userId, userId],
-          status: 'active',
-          currentTurn: waitingPlayer.userId,
-          gameStartTime: new Date(),
-          turnStartTime: new Date(),
-          isBotGame: false
-        });
-        await game.save();
-
-        // Clear waiting timeout for first player
-        if (activeGames.has(waitingPlayer.gameId)) {
-          const wd = activeGames.get(waitingPlayer.gameId);
-          if (wd.aiTimeout) clearTimeout(wd.aiTimeout);
-          activeGames.delete(waitingPlayer.gameId);
-        }
-
-        // Join both to room
-        const waitingSocket = io.sockets.sockets.get(waitingPlayer.socketId);
-        if (waitingSocket) waitingSocket.join(gameId);
-        socket.join(gameId);
-
-        activeGames.set(gameId, {});
-
-        io.to(gameId).emit('gameStarted', {
-          gameId,
-          players: game.players,
-          currentTurn: game.currentTurn,
-          isBot: false,
-          board: game.board,
-          turnStartTime: game.turnStartTime
-        });
-
-        startTurnTimer(gameId);
-
-      } else {
-        // Add to waiting queue
-        const gameId = generateGameId();
-        waitingQueue.push({ socketId: socket.id, userId, gameId });
-        socket.join(gameId);
-        socket.emit('waitingForPlayer', { gameId });
-
-        // 30s timeout -> AI game
-        const aiTimeout = setTimeout(async () => {
-          try {
-            const qIdx = waitingQueue.findIndex(p => p.userId === userId);
-            if (qIdx === -1) return; // Already matched
-            waitingQueue.splice(qIdx, 1);
-
-            const game = new Game({
-              gameId,
-              players: [userId, 0],
-              status: 'active',
-              currentTurn: userId,
-              gameStartTime: new Date(),
-              turnStartTime: new Date(),
-              isBotGame: true
-            });
-            await game.save();
-
-            activeGames.set(gameId, {});
-
-            io.to(gameId).emit('gameStarted', {
-              gameId,
-              players: game.players,
-              currentTurn: game.currentTurn,
-              isBot: true,
-              board: game.board,
-              turnStartTime: game.turnStartTime
-            });
-
-            startTurnTimer(gameId);
-          } catch (e) {
-            console.error('AI timeout error:', e);
-          }
-        }, 30000);
-
-        activeGames.set(gameId, { aiTimeout });
-      }
-    } catch (error) {
-      console.error('findGame error:', error);
-      socket.emit('error', { message: 'ဂိမ်းစတင်မှု မအောင်မြင်ပါ: ' + error.message });
-    }
-  });
-
-  socket.on('makeMove', async ({ gameId, row, col }) => {
-    try {
-      const userId = socketUserMap.get(socket.id);
-      if (!userId) return socket.emit('error', { message: 'Not authenticated' });
-
-      const game = await Game.findOne({ gameId });
-      if (!game || game.status !== 'active') {
-        return socket.emit('error', { message: 'Game not active' });
-      }
-      if (game.currentTurn !== userId) {
-        return socket.emit('error', { message: 'သင့်လှည့် မဟုတ်ပါ' });
-      }
-      if (game.board[row][col] !== '') {
-        return socket.emit('error', { message: 'ထိုနေရာတွင် ကစားပြီးပါပြီ' });
-      }
-
-      // Check time
-      const now = new Date();
-      const elapsed = (now - game.turnStartTime) / 1000;
-      if (elapsed > 6) {
-        // Timeout - auto lose
-        const winner = game.players.find(p => p !== userId) ?? 0;
-        game.winner = winner;
-        game.status = 'completed';
-        game.markModified('board');
-        await game.save();
-        clearTurnTimer(gameId);
-        io.to(gameId).emit('gameOver', { winner, board: game.board, reason: 'timeout' });
-        await handleGameEnd(game);
-        return;
-      }
-
-      const symbol = userId === game.players[0] ? 'X' : 'O';
-      game.board[row][col] = symbol;
-      game.markModified('board'); // FIX: needed for mongoose to detect nested array change
-      game.turnStartTime = now;
-
-      if (ai.checkWin(game.board, symbol)) {
-        game.winner = userId;
-        game.status = 'completed';
-        await game.save();
-        clearTurnTimer(gameId);
-        io.to(gameId).emit('gameOver', { winner: userId, board: game.board, reason: 'win' });
-        await handleGameEnd(game);
-        return;
-      }
-
-      const isFull = game.board.every(r => r.every(c => c !== ''));
-      if (isFull) {
-        game.winner = -1;
-        game.status = 'completed';
-        await game.save();
-        clearTurnTimer(gameId);
-        io.to(gameId).emit('gameOver', { winner: -1, board: game.board, reason: 'draw' });
-        await handleGameEnd(game);
-        return;
-      }
-
-      game.currentTurn = game.players.find(p => p !== userId);
-      game.turnStartTime = new Date();
-      await game.save();
-
-      io.to(gameId).emit('moveMade', {
-        board: game.board,
-        currentTurn: game.currentTurn,
-        turnStartTime: game.turnStartTime
-      });
-
-      resetTurnTimer(gameId);
-
-      // Bot move
-      if (game.currentTurn === 0) {
-        setTimeout(async () => {
-          try {
-            const g = await Game.findOne({ gameId });
-            if (!g || g.status !== 'active' || g.currentTurn !== 0) return;
-
-            const botSymbol = g.players[1] === 0 ? 'O' : 'X';
-            const move = ai.getBestMove(g.board.map(r => [...r]), botSymbol);
-            if (!move) return;
-
-            const [br, bc] = move;
-            g.board[br][bc] = botSymbol;
-            g.markModified('board');
-            g.turnStartTime = new Date();
-
-            if (ai.checkWin(g.board, botSymbol)) {
-              g.winner = 0;
-              g.status = 'completed';
-              await g.save();
-              clearTurnTimer(gameId);
-              io.to(gameId).emit('gameOver', { winner: 0, board: g.board, reason: 'bot_win' });
-              await handleGameEnd(g);
-              return;
-            }
-
-            const full = g.board.every(r => r.every(c => c !== ''));
-            if (full) {
-              g.winner = -1;
-              g.status = 'completed';
-              await g.save();
-              clearTurnTimer(gameId);
-              io.to(gameId).emit('gameOver', { winner: -1, board: g.board, reason: 'draw' });
-              await handleGameEnd(g);
-              return;
-            }
-
-            g.currentTurn = g.players[0];
-            await g.save();
-            io.to(gameId).emit('moveMade', { board: g.board, currentTurn: g.currentTurn, turnStartTime: g.turnStartTime });
-            resetTurnTimer(gameId);
-          } catch (e) {
-            console.error('Bot move error:', e);
-          }
-        }, 1500);
-      }
-    } catch (error) {
-      console.error('makeMove error:', error);
-      socket.emit('error', { message: 'Move failed: ' + error.message });
-    }
-  });
-
-  socket.on('cancelSearch', () => {
-    const userId = socketUserMap.get(socket.id);
-    if (!userId) return;
-    const idx = waitingQueue.findIndex(p => p.userId === userId);
-    if (idx !== -1) {
-      const item = waitingQueue.splice(idx, 1)[0];
-      if (activeGames.has(item.gameId)) {
-        const d = activeGames.get(item.gameId);
-        if (d.aiTimeout) clearTimeout(d.aiTimeout);
-        activeGames.delete(item.gameId);
-      }
-      // Refund
-      User.findOne({ telegramId: userId }).then(u => {
-        if (u) { u.balance += 1000; u.totalGames -= 1; u.save(); }
-      }).catch(() => {});
-      socket.emit('searchCancelled');
-    }
-  });
-
-  socket.on('disconnect', () => {
-    const userId = socketUserMap.get(socket.id);
-    socketUserMap.delete(socket.id);
-    // Remove from waiting queue
-    const idx = waitingQueue.findIndex(p => p.socketId === socket.id);
-    if (idx !== -1) {
-      const item = waitingQueue.splice(idx, 1)[0];
-      if (activeGames.has(item.gameId)) {
-        const d = activeGames.get(item.gameId);
-        if (d.aiTimeout) clearTimeout(d.aiTimeout);
-        activeGames.delete(item.gameId);
-      }
-      // Refund on disconnect while waiting
-      if (userId) {
-        User.findOne({ telegramId: userId }).then(u => {
-          if (u) { u.balance += 1000; u.totalGames -= 1; u.save(); }
-        }).catch(() => {});
-      }
-    }
-    console.log('👋 Disconnected:', socket.id);
-  });
-});
-
-function startTurnTimer(gameId) {
-  const timeout = setTimeout(async () => {
-    try {
-      const game = await Game.findOne({ gameId });
-      if (!game || game.status !== 'active') return;
-
-      const elapsed = (Date.now() - game.turnStartTime) / 1000;
-      if (elapsed >= 5) {
-        const loser = game.currentTurn;
-        const winner = game.players.find(p => p !== loser) ?? 0;
-        game.winner = winner;
-        game.status = 'completed';
-        await game.save();
-        clearTurnTimer(gameId);
-        io.to(gameId).emit('gameOver', { winner, board: game.board, reason: 'timeout' });
-        await handleGameEnd(game);
-      } else {
-        startTurnTimer(gameId);
-      }
-    } catch (e) {
-      console.error('Turn timer error:', e);
-    }
-  }, 1000);
-  gameTurnTimeouts.set(gameId, timeout);
 }
 
-function resetTurnTimer(gameId) {
-  clearTurnTimer(gameId);
-  startTurnTimer(gameId);
+// Delete all search notifications when game is found or cancelled
+async function deleteSearchMsgs(gameId) {
+  if (!bot) return;
+  const msgs = searchNotifications.get(gameId);
+  if (!msgs) return;
+  searchNotifications.delete(gameId);
+  for (const { userId, msgId } of msgs) {
+    try {
+      await bot.telegram.deleteMessage(userId, msgId);
+      await new Promise(r => setTimeout(r, 30));
+    } catch (e) {}
+  }
 }
 
+// ===== Game Logic =====
 function clearTurnTimer(gameId) {
   const t = gameTurnTimeouts.get(gameId);
   if (t) { clearTimeout(t); gameTurnTimeouts.delete(gameId); }
 }
 
-async function handleGameEnd(game) {
-  try {
-    if (game.winner && game.winner !== -1 && game.winner !== 0) {
-      // Human winner
-      const winner = await User.findOne({ telegramId: game.winner });
-      if (winner) {
-        winner.balance += 1600;
-        winner.wins += 1;
-        await winner.save();
-        try {
-          await bot.telegram.sendMessage(game.winner,
-            `🏆 *အနိုင်ရပြီ!*\n\n1600 MMK ရပါပြီ!\nလက်ကျန်: ${winner.balance} MMK`,
-            { parse_mode: 'Markdown' }
-          );
-        } catch (e) {}
-      }
-      const loserId = game.players.find(p => p !== game.winner && p !== 0);
-      if (loserId) {
-        const loser = await User.findOne({ telegramId: loserId });
-        if (loser) { loser.losses += 1; await loser.save(); }
-      }
-    } else if (game.winner === -1) {
-      // Draw
-      for (const pid of game.players) {
-        if (pid === 0) continue;
-        const u = await User.findOne({ telegramId: pid });
-        if (u) { u.balance += 500; await u.save(); }
-      }
-    }
-    // Bot wins - player already lost 1000
+async function endGame(gameId, winner, reason = 'normal') {
+  const game = activeGames.get(gameId);
+  if (!game || game.status !== 'active') return;
 
-    if (activeGames.has(game.gameId)) {
-      activeGames.delete(game.gameId);
+  clearTurnTimer(gameId);
+  game.status = 'completed';
+
+  try {
+    if (winner === -1) {
+      // Draw — refund both players
+      for (const pid of game.players) {
+        await User.findOneAndUpdate(
+          { telegramId: pid },
+          { $inc: { balance: DRAW_REFUND, totalGames: 1 } }
+        );
+      }
+    } else if (winner) {
+      const loser = game.players.find(p => p !== winner);
+      await User.findOneAndUpdate(
+        { telegramId: winner },
+        { $inc: { balance: WIN_PRIZE, wins: 1, totalGames: 1 } }
+      );
+      if (loser) {
+        await User.findOneAndUpdate(
+          { telegramId: loser },
+          { $inc: { losses: 1, totalGames: 1 } }
+        );
+      }
     }
+    await Game.findOneAndUpdate(
+      { gameId },
+      { winner, status: 'completed', board: game.board },
+      { upsert: true }
+    );
   } catch (e) {
-    console.error('handleGameEnd error:', e);
+    console.error('endGame DB err:', e);
   }
+
+  io.to(gameId).emit('gameOver', { winner, reason, board: game.board });
+  activeGames.delete(gameId);
+
+  // Clean up search notifications (if still pending)
+  setTimeout(() => deleteSearchMsgs(gameId), 500);
 }
 
-// ==================== Start ====================
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`✅ Server running on port ${PORT}`);
+// ===== Socket.IO =====
+io.on('connection', (socket) => {
+  let myUserId = null;
+  let myGameId = null;
+
+  socket.on('findGame', async ({ userId }) => {
+    if (!userId) return socket.emit('error', { msg: 'userId မပါ' });
+    myUserId = parseInt(userId);
+    userSockets.set(myUserId, socket.id);
+
+    // Check if reconnecting to an active game
+    const existEntry = [...activeGames.entries()].find(([, g]) => g.players.includes(myUserId));
+    if (existEntry) {
+      const [gid, game] = existEntry;
+      myGameId = gid;
+      socket.join(gid);
+      const sym = game.symbols instanceof Map
+        ? game.symbols.get(String(myUserId))
+        : game.symbols[myUserId];
+      socket.emit('gameResumed', {
+        gameId: gid,
+        board: game.board,
+        mySymbol: sym,
+        currentTurn: game.currentTurn,
+        players: game.playerNames
+      });
+      return;
+    }
+
+    const user = await User.findOne({ telegramId: myUserId }).lean();
+    if (!user)           return socket.emit('error', { msg: 'User မတွေ့ပါ' });
+    if (user.isBanned)   return socket.emit('error', { msg: 'ကောင်ပိတ်ဆို့ထားသည်' });
+    if (user.balance < ENTRY_FEE) {
+      return socket.emit('insufficientBalance', { balance: user.balance, required: ENTRY_FEE });
+    }
+
+    // Check if joining a specific game via bot notification link
+    const joinGameId = socket.handshake.query?.join;
+    let waiterIdx = -1;
+    if (joinGameId) {
+      waiterIdx = waitingQueue.findIndex(w => w.gameId === joinGameId && w.userId !== myUserId);
+    }
+    if (waiterIdx === -1) {
+      waiterIdx = waitingQueue.findIndex(w => w.userId !== myUserId);
+    }
+
+    if (waiterIdx !== -1) {
+      // ==== Match found ====
+      const waiter   = waitingQueue.splice(waiterIdx, 1)[0];
+      myGameId       = waiter.gameId;
+
+      // Deduct entry fees atomically using $inc (prevents race conditions)
+      try {
+        const w1 = await User.findOneAndUpdate(
+          { telegramId: waiter.userId, balance: { $gte: ENTRY_FEE } },
+          { $inc: { balance: -ENTRY_FEE } },
+          { new: true }
+        );
+        const w2 = await User.findOneAndUpdate(
+          { telegramId: myUserId, balance: { $gte: ENTRY_FEE } },
+          { $inc: { balance: -ENTRY_FEE } },
+          { new: true }
+        );
+        if (!w1 || !w2) {
+          if (w1) await User.findOneAndUpdate({ telegramId: waiter.userId }, { $inc: { balance: ENTRY_FEE } });
+          if (w2) await User.findOneAndUpdate({ telegramId: myUserId },      { $inc: { balance: ENTRY_FEE } });
+          waitingQueue.push(waiter);
+          return socket.emit('error', { msg: 'ငွေ မလုံလောက်ပါ' });
+        }
+      } catch (e) {
+        waitingQueue.push(waiter);
+        return socket.emit('error', { msg: 'ငွေ ဆုတ်ယူ မအောင်မြင်ပါ' });
+      }
+
+      const waiterUser = await User.findOne({ telegramId: waiter.userId }).lean();
+      const joinerUser = user;
+
+      // Randomly assign X / O
+      const symbols = {};
+      if (Math.random() > 0.5) {
+        symbols[waiter.userId] = 'X';
+        symbols[myUserId]      = 'O';
+      } else {
+        symbols[waiter.userId] = 'O';
+        symbols[myUserId]      = 'X';
+      }
+      const firstTurn = parseInt(Object.entries(symbols).find(([, v]) => v === 'X')[0]);
+
+      const gameState = {
+        gameId:      myGameId,
+        players:     [waiter.userId, myUserId],
+        symbols,
+        board:       Array(5).fill(null).map(() => Array(5).fill('')),
+        currentTurn: firstTurn,
+        status:      'active',
+        playerNames: {
+          [waiter.userId]: waiterUser?.firstName || waiterUser?.username || `User${waiter.userId}`,
+          [myUserId]:      joinerUser?.firstName || joinerUser?.username || `User${myUserId}`
+        }
+      };
+
+      activeGames.set(myGameId, gameState);
+
+      new Game({
+        gameId:  myGameId,
+        players: gameState.players,
+        symbols: gameState.symbols,
+        status:  'active'
+      }).save().catch(e => console.error('Game save:', e));
+
+      socket.join(myGameId);
+      const waiterSocket = io.sockets.sockets.get(waiter.socketId);
+      if (waiterSocket) waiterSocket.join(myGameId);
+
+      const base = {
+        gameId:      myGameId,
+        board:       gameState.board,
+        currentTurn: firstTurn,
+        players:     gameState.playerNames
+      };
+      socket.emit('gameStarted',  { ...base, mySymbol: symbols[myUserId] });
+      if (waiterSocket) waiterSocket.emit('gameStarted', { ...base, mySymbol: symbols[waiter.userId] });
+
+      // Delete all pending search notifications immediately
+      await deleteSearchMsgs(myGameId);
+
+      // Start first turn timer
+      const t = setTimeout(() => handleTurnTimeout(myGameId, firstTurn), TURN_SECONDS * 1000 + 1500);
+      gameTurnTimeouts.set(myGameId, t);
+
+    } else {
+      // ==== Add to waiting queue ====
+      const gameId = genGameId();
+      myGameId = gameId;
+      socket.join(gameId);
+      waitingQueue.push({ socketId: socket.id, userId: myUserId, gameId });
+      socket.emit('waitingForPlayer', { gameId, searchTimeout: SEARCH_TIMEOUT_S });
+
+      // Notify other users via bot
+      notifyUsersGameSearch(myUserId, gameId);
+
+      // Auto-cancel after SEARCH_TIMEOUT_S seconds
+      setTimeout(async () => {
+        const idx = waitingQueue.findIndex(w => w.gameId === gameId);
+        if (idx !== -1) {
+          waitingQueue.splice(idx, 1);
+          await deleteSearchMsgs(gameId);
+          socket.emit('searchTimeout', { msg: 'ကစားမည့်သူ မတွေ့ပါ' });
+        }
+      }, SEARCH_TIMEOUT_S * 1000);
+    }
+  });
+
+  socket.on('cancelSearch', async ({ userId }) => {
+    const uid = parseInt(userId || myUserId);
+    const idx = waitingQueue.findIndex(w => w.userId === uid);
+    if (idx !== -1) {
+      const { gameId } = waitingQueue[idx];
+      waitingQueue.splice(idx, 1);
+      await deleteSearchMsgs(gameId);
+    }
+    socket.emit('searchCancelled');
+  });
+
+  socket.on('makeMove', async ({ gameId, row, col }) => {
+    const game = activeGames.get(gameId);
+    if (!game || game.status !== 'active')  return;
+    if (game.currentTurn !== myUserId)       return socket.emit('error', { msg: 'သင့်လှည့် မဟုတ်ပါ' });
+    if (row < 0 || row > 4 || col < 0 || col > 4) return socket.emit('error', { msg: 'Invalid move' });
+    if (game.board[row][col] !== '')         return socket.emit('error', { msg: 'ထိုနေရာ ယူပြီးသား' });
+
+    clearTurnTimer(gameId);
+
+    const sym = game.symbols[myUserId];
+    game.board[row][col] = sym;
+
+    io.to(gameId).emit('moveMade', { row, col, symbol: sym, playerId: myUserId, board: game.board });
+
+    if (checkWin(game.board, sym)) {
+      await endGame(gameId, myUserId, 'win');
+    } else if (boardFull(game.board)) {
+      await endGame(gameId, -1, 'draw');
+    } else {
+      const next = game.players.find(p => p !== myUserId);
+      game.currentTurn = next;
+      io.to(gameId).emit('turnChanged', { currentTurn: next });
+
+      const t = setTimeout(() => handleTurnTimeout(gameId, next), TURN_SECONDS * 1000 + 1500);
+      gameTurnTimeouts.set(gameId, t);
+    }
+  });
+
+  socket.on('disconnect', async () => {
+    // Remove from waiting queue if still searching
+    const wIdx = waitingQueue.findIndex(w => w.socketId === socket.id);
+    if (wIdx !== -1) {
+      const { gameId } = waitingQueue[wIdx];
+      waitingQueue.splice(wIdx, 1);
+      await deleteSearchMsgs(gameId);
+    }
+
+    // Handle disconnect during active game
+    if (myGameId && activeGames.has(myGameId)) {
+      const game = activeGames.get(myGameId);
+      if (game?.status === 'active') {
+        const opp = game.players.find(p => p !== myUserId);
+        if (opp) {
+          const oppSid = userSockets.get(opp);
+          if (oppSid) io.to(oppSid).emit('opponentDisconnected', { reconnectWindow: 30 });
+
+          // Give 30 seconds for reconnect before forfeiting
+          setTimeout(async () => {
+            const g = activeGames.get(myGameId);
+            if (g?.status === 'active') {
+              const newSid = userSockets.get(myUserId);
+              if (!newSid || !io.sockets.sockets.get(newSid)) {
+                await endGame(myGameId, opp, 'disconnect');
+              }
+            }
+          }, 30000);
+        }
+      }
+    }
+
+    if (myUserId) userSockets.delete(myUserId);
+  });
+
+  async function handleTurnTimeout(gameId, playerId) {
+    const game = activeGames.get(gameId);
+    if (!game || game.status !== 'active' || game.currentTurn !== playerId) return;
+    const opp = game.players.find(p => p !== playerId);
+    await endGame(gameId, opp, 'timeout');
+  }
 });
 
-process.on('SIGTERM', async () => {
-  for (const t of gameTurnTimeouts.values()) clearTimeout(t);
-  for (const d of activeGames.values()) if (d.aiTimeout) clearTimeout(d.aiTimeout);
-  if (bot) bot.stop('SIGTERM');
-  await mongoose.disconnect();
-  server.close(() => process.exit(0));
+// ===== Admin Middleware =====
+function isAdmin(req, res, next) {
+  const aid = parseInt(req.headers['x-admin-id'] || req.query.adminId);
+  if (!aid || aid !== ADMIN_ID) return res.status(403).json({ error: 'Forbidden' });
+  next();
+}
+
+// ===== API Routes =====
+app.get('/', (_, res) => res.json({ ok: true }));
+app.get('/health', (_, res) => res.json({
+  ok: true,
+  mongodb:     isConnected ? 'connected' : 'disconnected',
+  activeGames: activeGames.size,
+  queue:       waitingQueue.length
+}));
+
+// Auth
+app.post('/api/auth', async (req, res) => {
+  try {
+    const { initData, telegramId: devId } = req.body;
+    let tid, username, firstName;
+
+    if (initData) {
+      const u = verifyTgAuth(initData);
+      if (!u) return res.status(401).json({ error: 'Telegram auth မှား' });
+      tid = u.id; username = u.username || ''; firstName = u.first_name || '';
+    } else if (devId) {
+      tid = parseInt(devId); username = ''; firstName = 'User';
+    } else {
+      return res.status(401).json({ error: 'Auth required' });
+    }
+
+    const maint = await getSetting('maintenance', false);
+    if (maint && tid !== ADMIN_ID) return res.status(503).json({ error: '🔧 ဆာဗာ ပြင်ဆင်နေပါသည်' });
+
+    let user = await User.findOne({ telegramId: tid });
+    if (!user) {
+      user = new User({ telegramId: tid, username, firstName, referralCode: genRefCode(tid) });
+      await user.save();
+    } else {
+      let dirty = false;
+      if (username  && user.username  !== username)  { user.username  = username;  dirty = true; }
+      if (firstName && user.firstName !== firstName) { user.firstName = firstName; dirty = true; }
+      if (dirty) await user.save();
+    }
+
+    if (user.isBanned) return res.status(403).json({ error: '🚫 ကောင်ပိတ်ဆို့ထားပါသည်' });
+
+    res.json({
+      telegramId:   user.telegramId,
+      username:     user.username || user.firstName || `User${user.telegramId}`,
+      firstName:    user.firstName,
+      balance:      user.balance,
+      referralCode: user.referralCode,
+      totalGames:   user.totalGames,
+      wins:         user.wins,
+      losses:       user.losses
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Server error' });
+  }
 });
+
+// Get user info
+app.get('/api/user/:id', async (req, res) => {
+  try {
+    const u = await User.findOne({ telegramId: parseInt(req.params.id) })
+      .select('balance totalGames wins losses').lean();
+    if (!u) return res.status(404).json({ error: 'Not found' });
+    res.json(u);
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Deposit request
+app.post('/api/deposit', async (req, res) => {
+  try {
+    const { telegramId, kpayName, transactionId, amount } = req.body;
+    if (!telegramId || !kpayName || !transactionId || !amount)
+      return res.status(400).json({ error: 'ကွင်းလပ်များ ဖြည့်ပေးပါ' });
+    if (parseInt(amount) < 1000)
+      return res.status(400).json({ error: 'အနည်းဆုံး 1,000 MMK' });
+
+    const u = await User.findOne({ telegramId: parseInt(telegramId) }).lean();
+    if (!u)          return res.status(404).json({ error: 'User not found' });
+    if (u.isBanned)  return res.status(403).json({ error: 'ကောင်ပိတ်ဆို့ထားသည်' });
+
+    const dup = await Deposit.findOne({ transactionId }).lean();
+    if (dup) return res.status(400).json({ error: 'Transaction ID ကို အသုံးပြုပြီးသည်' });
+
+    const dep = await new Deposit({
+      userId: u.telegramId, kpayName, transactionId, amount: parseInt(amount)
+    }).save();
+
+    if (bot) {
+      bot.telegram.sendMessage(
+        ADMIN_ID,
+        `💰 *ငွေသွင်း တောင်းဆိုမှု*\n👤 ${u.firstName || u.username} (${u.telegramId})\n💵 ${parseInt(amount).toLocaleString()} MMK\n📝 ${kpayName}\n🔢 \`${transactionId}\``,
+        { parse_mode: 'Markdown' }
+      ).catch(() => {});
+    }
+
+    res.json({ success: true, depositId: dep._id });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Withdrawal request
+app.post('/api/withdraw', async (req, res) => {
+  try {
+    const { telegramId, kpayName, kpayNumber, amount } = req.body;
+    if (!telegramId || !kpayName || !kpayNumber || !amount)
+      return res.status(400).json({ error: 'ကွင်းလပ်များ ဖြည့်ပေးပါ' });
+    if (parseInt(amount) < 3000)
+      return res.status(400).json({ error: 'အနည်းဆုံး 3,000 MMK' });
+
+    // Atomic deduction — only deducts if balance is sufficient
+    const u = await User.findOneAndUpdate(
+      { telegramId: parseInt(telegramId), balance: { $gte: parseInt(amount) }, isBanned: false },
+      { $inc: { balance: -parseInt(amount) } },
+      { new: true }
+    );
+    if (!u) return res.status(400).json({ error: 'လက်ကျန်ငွေ မလုံလောက်ပါ' });
+
+    const wd = await new Withdrawal({
+      userId: u.telegramId, kpayName, kpayNumber, amount: parseInt(amount)
+    }).save();
+
+    if (bot) {
+      bot.telegram.sendMessage(
+        ADMIN_ID,
+        `💸 *ငွေထုတ် တောင်းဆိုမှု*\n👤 ${u.firstName || u.username} (${u.telegramId})\n💵 ${parseInt(amount).toLocaleString()} MMK\n📝 ${kpayName}\n📱 ${kpayNumber}`,
+        { parse_mode: 'Markdown' }
+      ).catch(() => {});
+    }
+
+    res.json({ success: true, withdrawalId: wd._id, newBalance: u.balance });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ===== Admin Routes =====
+
+// Stats overview
+app.get('/api/admin/stats', isAdmin, async (_, res) => {
+  try {
+    const [tu, tg, pd, pw] = await Promise.all([
+      User.countDocuments(),
+      Game.countDocuments({ status: 'completed' }),
+      Deposit.countDocuments({ status: 'pending' }),
+      Withdrawal.countDocuments({ status: 'pending' })
+    ]);
+    const [depAgg, wdAgg] = await Promise.all([
+      Deposit.aggregate([{ $match: { status: 'confirmed' } }, { $group: { _id: null, t: { $sum: '$amount' } } }]),
+      Withdrawal.aggregate([{ $match: { status: 'confirmed' } }, { $group: { _id: null, t: { $sum: '$amount' } } }])
+    ]);
+    res.json({
+      totalUsers:        tu,
+      totalGames:        tg,
+      pendingDeposits:   pd,
+      pendingWithdrawals: pw,
+      activeGames:       activeGames.size,
+      queueLength:       waitingQueue.length,
+      totalDeposited:    depAgg[0]?.t || 0,
+      totalWithdrawn:    wdAgg[0]?.t  || 0
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Settings
+app.get('/api/admin/settings', isAdmin, async (_, res) => {
+  const maint = await getSetting('maintenance', false);
+  res.json({ maintenance: maint, entryFee: ENTRY_FEE, winPrize: WIN_PRIZE, drawRefund: DRAW_REFUND, turnSeconds: TURN_SECONDS });
+});
+
+app.post('/api/admin/maintenance', isAdmin, async (req, res) => {
+  await setSetting('maintenance', !!req.body.enabled);
+  res.json({ success: true, maintenance: !!req.body.enabled });
+});
+
+// Deposits
+app.get('/api/admin/deposits', isAdmin, async (req, res) => {
+  try {
+    const deps = await Deposit.find({ status: req.query.status || 'pending' })
+      .sort({ createdAt: -1 }).limit(50).lean();
+    const out = await Promise.all(deps.map(async d => {
+      const u = await User.findOne({ telegramId: d.userId }).select('firstName username').lean();
+      return { ...d, userName: u?.firstName || u?.username || String(d.userId) };
+    }));
+    res.json(out);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/admin/deposits/:id/confirm', isAdmin, async (req, res) => {
+  try {
+    const dep = await Deposit.findById(req.params.id);
+    if (!dep) return res.status(404).json({ error: 'Not found' });
+    if (dep.status !== 'pending') return res.status(400).json({ error: 'Already processed' });
+
+    dep.status = 'confirmed';
+    dep.processedAt = new Date();
+    await dep.save();
+
+    // Credit balance atomically
+    await User.findOneAndUpdate({ telegramId: dep.userId }, { $inc: { balance: dep.amount } });
+
+    // Referral bonus — only on first ever confirmed deposit
+    const user = await User.findOne({ telegramId: dep.userId }).lean();
+    if (user?.referredBy) {
+      const prevDeps = await Deposit.countDocuments({
+        userId: dep.userId, status: 'confirmed', _id: { $ne: dep._id }
+      });
+      if (prevDeps === 0) {
+        await User.findOneAndUpdate({ telegramId: user.referredBy }, { $inc: { balance: 100 } });
+        if (bot) {
+          bot.telegram.sendMessage(
+            user.referredBy,
+            `🎉 သူငယ်ချင်း တစ်ယောက်မှ 1,000 MMK ဖြည့်သောကြောင့် သင် <b>100 MMK</b> ရရှိပါပြီ!`,
+            { parse_mode: 'HTML' }
+          ).catch(() => {});
+        }
+      }
+    }
+
+    if (bot) {
+      bot.telegram.sendMessage(
+        dep.userId,
+        `✅ ငွေ ${dep.amount.toLocaleString()} MMK သွင်းမှု အတည်ပြုပြီး!\n\nသင့်လက်ကျန်ငွေ ပေါင်းထည့်ပြီး 🎉`,
+        Markup.inlineKeyboard([[Markup.button.webApp('🎮 ကစားမည်', FRONTEND_URL)]])
+      ).catch(() => {});
+    }
+
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/admin/deposits/:id/reject', isAdmin, async (req, res) => {
+  try {
+    const dep = await Deposit.findByIdAndUpdate(
+      req.params.id,
+      { status: 'rejected', processedAt: new Date() },
+      { new: true }
+    );
+    if (!dep) return res.status(404).json({ error: 'Not found' });
+    if (bot) {
+      bot.telegram.sendMessage(
+        dep.userId,
+        `❌ ငွေ ${dep.amount.toLocaleString()} MMK သွင်းမှု ပယ်ချပြီ\nTxn: ${dep.transactionId}`
+      ).catch(() => {});
+    }
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Withdrawals
+app.get('/api/admin/withdrawals', isAdmin, async (req, res) => {
+  try {
+    const wds = await Withdrawal.find({ status: req.query.status || 'pending' })
+      .sort({ createdAt: -1 }).limit(50).lean();
+    const out = await Promise.all(wds.map(async w => {
+      const u = await User.findOne({ telegramId: w.userId }).select('firstName username balance').lean();
+      return { ...w, userName: u?.firstName || u?.username || String(w.userId), userBalance: u?.balance };
+    }));
+    res.json(out);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/admin/withdrawals/:id/confirm', isAdmin, async (req, res) => {
+  try {
+    const wd = await Withdrawal.findById(req.params.id);
+    if (!wd) return res.status(404).json({ error: 'Not found' });
+    if (wd.status !== 'pending') return res.status(400).json({ error: 'Already processed' });
+
+    wd.status = 'confirmed';
+    wd.processedAt = new Date();
+    await wd.save();
+
+    if (bot) {
+      bot.telegram.sendMessage(
+        wd.userId,
+        `✅ ငွေ ${wd.amount.toLocaleString()} MMK ထုတ်မှု အတည်ပြုပြီး!\nKPay: ${wd.kpayNumber} 🎉`
+      ).catch(() => {});
+    }
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/admin/withdrawals/:id/reject', isAdmin, async (req, res) => {
+  try {
+    const wd = await Withdrawal.findById(req.params.id);
+    if (!wd) return res.status(404).json({ error: 'Not found' });
+    if (wd.status !== 'pending') return res.status(400).json({ error: 'Already processed' });
+
+    wd.status = 'rejected';
+    wd.processedAt = new Date();
+    await wd.save();
+
+    // Refund balance
+    await User.findOneAndUpdate({ telegramId: wd.userId }, { $inc: { balance: wd.amount } });
+
+    if (bot) {
+      bot.telegram.sendMessage(
+        wd.userId,
+        `❌ ငွေ ${wd.amount.toLocaleString()} MMK ထုတ်မှု ပယ်ချပြီး ငွေပြန်အမ်းပြီ`
+      ).catch(() => {});
+    }
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Users
+app.get('/api/admin/users', isAdmin, async (req, res) => {
+  try {
+    const { search, page = 1 } = req.query;
+    const q = search ? {
+      $or: [
+        { telegramId: isNaN(search) ? -1 : parseInt(search) },
+        { username:   { $regex: search, $options: 'i' } },
+        { firstName:  { $regex: search, $options: 'i' } }
+      ]
+    } : {};
+    const users = await User.find(q).sort({ createdAt: -1 }).skip((page - 1) * 20).limit(20).lean();
+    const total = await User.countDocuments(q);
+    res.json({ users, total, pages: Math.ceil(total / 20) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Manual balance adjustment
+app.post('/api/admin/users/:tid/balance', isAdmin, async (req, res) => {
+  try {
+    const { amount, reason } = req.body;
+    const u = await User.findOneAndUpdate(
+      { telegramId: parseInt(req.params.tid) },
+      { $inc: { balance: parseInt(amount) } },
+      { new: true }
+    );
+    if (!u) return res.status(404).json({ error: 'Not found' });
+    if (bot) {
+      const sign = amount > 0 ? '+' : '';
+      bot.telegram.sendMessage(
+        u.telegramId,
+        `💰 Admin မှ ${sign}${parseInt(amount).toLocaleString()} MMK\n${reason ? `မှတ်ချက်: ${reason}` : ''}\nလက်ကျန်: ${u.balance.toLocaleString()} MMK`
+      ).catch(() => {});
+    }
+    res.json({ success: true, newBalance: u.balance });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Ban / Unban
+app.post('/api/admin/users/:tid/ban', isAdmin, async (req, res) => {
+  try {
+    const { ban } = req.body;
+    const u = await User.findOneAndUpdate(
+      { telegramId: parseInt(req.params.tid) },
+      { isBanned: !!ban },
+      { new: true }
+    );
+    if (!u) return res.status(404).json({ error: 'Not found' });
+    if (bot && ban) {
+      bot.telegram.sendMessage(u.telegramId, '🚫 ကောင်ပိတ်ဆို့ထားပါသည်။ Admin ကို ဆက်သွယ်ပါ').catch(() => {});
+    }
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Broadcast
+app.post('/api/admin/broadcast', isAdmin, async (req, res) => {
+  try {
+    const { message, buttonText, buttonUrl } = req.body;
+    if (!message) return res.status(400).json({ error: 'Message required' });
+
+    res.json({ success: true, msg: 'Broadcast started in background' });
+
+    const users = await User.find({ isBanned: false }).select('telegramId').lean();
+    const kb = buttonText && buttonUrl
+      ? { inline_keyboard: [[{ text: buttonText, url: buttonUrl }]] }
+      : undefined;
+
+    let sent = 0, fail = 0;
+    for (const u of users) {
+      try {
+        await bot.telegram.sendMessage(u.telegramId, message, { parse_mode: 'HTML', reply_markup: kb });
+        sent++;
+        await new Promise(r => setTimeout(r, 50));
+      } catch (e) { fail++; }
+    }
+    console.log(`Broadcast: ${sent} sent, ${fail} failed`);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Send message to single user
+app.post('/api/admin/message', isAdmin, async (req, res) => {
+  try {
+    const { telegramId, message } = req.body;
+    if (!telegramId || !message) return res.status(400).json({ error: 'Missing fields' });
+    await bot.telegram.sendMessage(parseInt(telegramId), message, { parse_mode: 'HTML' });
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===== Self-ping to keep Render awake =====
+setInterval(() => {
+  try {
+    https.get(`${BACKEND_URL}/health`, () => {}).on('error', () => {});
+  } catch (e) {}
+}, 5 * 60 * 1000); // every 5 minutes
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log(`🚀 Server on port ${PORT}`));
+
+process.on('unhandledRejection', e => console.error('UnhandledRejection:', e));
+process.on('uncaughtException',  e => console.error('UncaughtException:',  e));
