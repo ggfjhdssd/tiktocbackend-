@@ -12,26 +12,44 @@ dotenv.config();
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, {
-  cors: {
-    origin: ['https://tictokfrontend.vercel.app', 'http://localhost:3000'],
-    methods: ['GET', 'POST'],
-    credentials: true
+
+// ==================== CORS Configuration ====================
+// Simple CORS - အရင်ဆုံး ဒီလိုစမ်းပါ
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+  
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
   }
+  next();
 });
 
-// Middleware
 app.use(express.json());
-app.use(cors({
-  origin: ['https://tictokfrontend.vercel.app', 'http://localhost:3000'],
-  credentials: true
-}));
 
-// Environment Variables with validation
+// ==================== Socket.io with CORS ====================
+const io = new Server(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"],
+    credentials: true,
+    transports: ['websocket', 'polling']
+  },
+  allowEIO3: true
+});
+
+// ==================== Environment Variables Validation ====================
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_ID = process.env.ADMIN_ID ? parseInt(process.env.ADMIN_ID) : null;
 const MONGODB_URI1 = process.env.MONGODB_URI1;
 const MONGODB_URI2 = process.env.MONGODB_URI2;
+
+console.log('🔍 Checking environment variables...');
+console.log(`- BOT_TOKEN: ${BOT_TOKEN ? '✅ Set' : '❌ Not set'}`);
+console.log(`- ADMIN_ID: ${ADMIN_ID ? '✅ Set' : '❌ Not set'}`);
+console.log(`- MONGODB_URI1: ${MONGODB_URI1 ? '✅ Set' : '❌ Not set'}`);
+console.log(`- MONGODB_URI2: ${MONGODB_URI2 ? '✅ Set' : '❌ Not set'}`);
 
 // Validate required environment variables
 if (!BOT_TOKEN) {
@@ -49,25 +67,14 @@ if (!MONGODB_URI1) {
   process.exit(1);
 }
 
-if (!MONGODB_URI2) {
-  console.warn('⚠️ MONGODB_URI2 is not set - failover will not work');
-}
-
-console.log('✅ Environment variables loaded:');
-console.log(`- BOT_TOKEN: ${BOT_TOKEN.substring(0, 10)}...`);
-console.log(`- ADMIN_ID: ${ADMIN_ID}`);
-console.log(`- MONGODB_URI1: ${MONGODB_URI1 ? MONGODB_URI1.substring(0, 20) + '...' : 'NOT SET'}`);
-console.log(`- MONGODB_URI2: ${MONGODB_URI2 ? MONGODB_URI2.substring(0, 20) + '...' : 'NOT SET'}`);
-
 // ==================== MongoDB Connection with Failover ====================
 let isConnected = false;
 let activeConnectionString = MONGODB_URI1;
-let dbConnection = null;
 let reconnectTimer = null;
 
 const connectWithFailover = async (retryCount = 0) => {
   const maxRetries = 5;
-  const baseDelay = 5000; // 5 seconds
+  const baseDelay = 5000;
 
   const connectToURI = async (uri) => {
     if (!uri) {
@@ -76,9 +83,8 @@ const connectWithFailover = async (retryCount = 0) => {
     }
 
     try {
-      console.log(`🔄 Attempting to connect to MongoDB: ${uri.substring(0, 25)}...`);
+      console.log(`🔄 Attempting to connect to MongoDB...`);
       
-      // Disconnect existing connection if any
       if (mongoose.connection.readyState !== 0) {
         await mongoose.disconnect();
       }
@@ -88,15 +94,12 @@ const connectWithFailover = async (retryCount = 0) => {
         useUnifiedTopology: true,
         serverSelectionTimeoutMS: 10000,
         socketTimeoutMS: 45000,
-        heartbeatFrequencyMS: 10000,
-        retryWrites: true,
-        retryReads: true
       });
 
-      console.log(`✅ Connected to MongoDB: ${uri.substring(0, 25)}...`);
+      console.log(`✅ Connected to MongoDB successfully`);
       return conn;
     } catch (error) {
-      console.error(`❌ Failed to connect to ${uri.substring(0, 25)}...:`, error.message);
+      console.error(`❌ Failed to connect to MongoDB:`, error.message);
       return null;
     }
   };
@@ -129,60 +132,17 @@ const connectWithFailover = async (retryCount = 0) => {
         connectWithFailover(retryCount + 1);
       }, delay);
     } else {
-      console.error('❌ Max retries reached. Will continue without database...');
-      // Don't exit, let the server run but with limited functionality
+      console.error('❌ Max retries reached. Continuing without database...');
     }
     return;
   }
 
-  dbConnection = connection;
   isConnected = true;
-  retryCount = 0; // Reset retry count on successful connection
 
   // Monitor connection events
-  mongoose.connection.on('disconnected', async () => {
-    console.log('❌ MongoDB disconnected! Attempting failover...');
+  mongoose.connection.on('disconnected', () => {
+    console.log('❌ MongoDB disconnected!');
     isConnected = false;
-    
-    // Clear any existing reconnect timer
-    if (reconnectTimer) {
-      clearTimeout(reconnectTimer);
-    }
-
-    // Try to reconnect with exponential backoff
-    const tryReconnect = async (attempt = 0) => {
-      const newURI = activeConnectionString === MONGODB_URI1 ? MONGODB_URI2 : MONGODB_URI1;
-      
-      if (!newURI) {
-        console.error('❌ No alternative MongoDB URI available');
-        return;
-      }
-      
-      console.log(`🔄 Failing over to: ${newURI.substring(0, 25)}... (Attempt ${attempt + 1})`);
-      
-      try {
-        await mongoose.connect(newURI, {
-          useNewUrlParser: true,
-          useUnifiedTopology: true,
-          serverSelectionTimeoutMS: 10000,
-        });
-        
-        activeConnectionString = newURI;
-        isConnected = true;
-        console.log('✅ Failover successful!');
-      } catch (error) {
-        console.error('❌ Failover attempt failed:', error.message);
-        
-        if (attempt < 5) {
-          const delay = Math.min(1000 * Math.pow(2, attempt), 30000);
-          reconnectTimer = setTimeout(() => tryReconnect(attempt + 1), delay);
-        } else {
-          console.error('❌ Max failover attempts reached. Manual intervention required.');
-        }
-      }
-    };
-
-    tryReconnect();
   });
 
   mongoose.connection.on('error', (err) => {
@@ -269,17 +229,11 @@ function generateGameId() {
   return 'game_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
 }
 
-// ==================== Minimax AI for 5x5 (4-in-a-row) ====================
+// ==================== Minimax AI ====================
 class TicTacToeAI {
   constructor() {
     this.boardSize = 5;
     this.winLength = 4;
-  }
-
-  evaluateBoard(board, player, opponent) {
-    if (this.checkWin(board, player)) return 100;
-    if (this.checkWin(board, opponent)) return -100;
-    return 0;
   }
 
   checkWin(board, symbol) {
@@ -344,10 +298,8 @@ class TicTacToeAI {
   }
 
   minimax(board, depth, isMaximizing, player, opponent, alpha, beta) {
-    const score = this.evaluateBoard(board, player, opponent);
-    
-    if (score === 100) return score - depth;
-    if (score === -100) return score + depth;
+    if (this.checkWin(board, player)) return 100 - depth;
+    if (this.checkWin(board, opponent)) return -100 + depth;
     
     const emptyCells = this.getEmptyCells(board);
     if (emptyCells.length === 0) return 0;
@@ -502,60 +454,34 @@ bot.command('admin', (ctx) => {
   }
 });
 
-bot.action(/join_(.+)/, async (ctx) => {
-  const gameId = ctx.match[1];
-  const userId = ctx.from.id;
-
-  try {
-    const game = await Game.findOne({ gameId, status: 'waiting' });
-    if (!game) {
-      return ctx.answerCbQuery('❌ Game no longer available.');
-    }
-
-    if (game.players.includes(userId)) {
-      return ctx.answerCbQuery('⚠️ You are already in this game.');
-    }
-
-    const user = await User.findOne({ telegramId: userId });
-    if (!user || user.balance < 1000) {
-      return ctx.answerCbQuery('💰 Insufficient balance to join.');
-    }
-
-    user.balance -= 1000;
-    await user.save();
-
-    game.players.push(userId);
-    game.status = 'active';
-    game.currentTurn = game.players[0];
-    game.gameStartTime = new Date();
-    game.lastMoveTime = new Date();
-    game.turnStartTime = new Date();
-    await game.save();
-
-    io.to(gameId).emit('gameStarted', { 
-      gameId, 
-      players: game.players, 
-      currentTurn: game.currentTurn,
-      turnStartTime: game.turnStartTime
-    });
-
-    ctx.answerCbQuery('✅ Game joined!');
-    ctx.editMessageText('🎮 Game started!', { reply_markup: {} });
-  } catch (error) {
-    console.error('Join game error:', error);
-    ctx.answerCbQuery('❌ Error joining game');
-  }
-});
-
 bot.launch().then(() => console.log('✅ Bot started')).catch(err => {
   console.error('❌ Bot failed to start:', err);
 });
 
-// Enable graceful stop
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
-
 // ==================== API Routes ====================
+// Health check endpoint
+app.get('/', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    message: 'TicToeTic Backend is running',
+    time: new Date().toISOString()
+  });
+});
+
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    mongodb: isConnected ? 'connected' : 'disconnected',
+    uptime: process.uptime(),
+    env: {
+      botToken: BOT_TOKEN ? '✅ Set' : '❌ Not set',
+      adminId: ADMIN_ID ? '✅ Set' : '❌ Not set',
+      mongodb1: MONGODB_URI1 ? '✅ Set' : '❌ Not set',
+      mongodb2: MONGODB_URI2 ? '✅ Set' : '❌ Not set'
+    }
+  });
+});
+
 app.post('/api/auth', async (req, res) => {
   try {
     const { initData } = req.body;
@@ -625,7 +551,7 @@ app.post('/api/deposit', async (req, res) => {
     await deposit.save();
 
     await bot.telegram.sendMessage(ADMIN_ID, 
-      `💰 *New Deposit Request*\n\nUser: ${user.username || 'N/A'} (${user.telegramId})\nAmount: ${amount} MMK\nKPay Name: ${kpayName}\nTransaction ID: ${transactionId}\n\nApprove or reject in admin panel.`,
+      `💰 *New Deposit Request*\n\nUser: ${user.username || 'N/A'} (${user.telegramId})\nAmount: ${amount} MMK\nKPay Name: ${kpayName}\nTransaction ID: ${transactionId}`,
       { parse_mode: 'Markdown' }
     );
 
@@ -659,7 +585,7 @@ app.post('/api/withdraw', async (req, res) => {
     await withdrawal.save();
 
     await bot.telegram.sendMessage(ADMIN_ID,
-      `💸 *New Withdrawal Request*\n\nUser: ${user.username || 'N/A'} (${user.telegramId})\nAmount: ${amount} MMK\nKPay Name: ${kpayName}\nKPay Number: ${kpayNumber}\n\nApprove or reject in admin panel.`,
+      `💸 *New Withdrawal Request*\n\nUser: ${user.username || 'N/A'} (${user.telegramId})\nAmount: ${amount} MMK\nKPay Name: ${kpayName}\nKPay Number: ${kpayNumber}`,
       { parse_mode: 'Markdown' }
     );
 
@@ -735,7 +661,7 @@ app.post('/api/admin/confirm-deposit', async (req, res) => {
     }
 
     await bot.telegram.sendMessage(deposit.userId, 
-      `✅ *Deposit Confirmed*\n\nYour deposit of ${deposit.amount} MMK has been confirmed.\nNew balance: ${user.balance} MMK.\n\nThank you for using TicToeTic!`,
+      `✅ *Deposit Confirmed*\n\nYour deposit of ${deposit.amount} MMK has been confirmed.\nNew balance: ${user.balance} MMK.`,
       { parse_mode: 'Markdown' }
     );
 
@@ -760,7 +686,7 @@ app.post('/api/admin/reject-deposit', async (req, res) => {
     await deposit.save();
 
     await bot.telegram.sendMessage(deposit.userId, 
-      `❌ *Deposit Rejected*\n\nYour deposit of ${deposit.amount} MMK has been rejected.\nReason: ${reason || 'Please contact admin for details.'}\n\nPlease check and try again.`,
+      `❌ *Deposit Rejected*\n\nYour deposit of ${deposit.amount} MMK has been rejected.\nReason: ${reason || 'Please contact admin for details.'}`,
       { parse_mode: 'Markdown' }
     );
 
@@ -796,7 +722,7 @@ app.post('/api/admin/confirm-withdrawal', async (req, res) => {
     await withdrawal.save();
 
     await bot.telegram.sendMessage(withdrawal.userId, 
-      `✅ *Withdrawal Confirmed*\n\nYour withdrawal of ${withdrawal.amount} MMK has been confirmed and sent to your KPay account.\nKPay Name: ${withdrawal.kpayName}\nKPay Number: ${withdrawal.kpayNumber}\nNew balance: ${user.balance} MMK.\n\nThank you for using TicToeTic!`,
+      `✅ *Withdrawal Confirmed*\n\nYour withdrawal of ${withdrawal.amount} MMK has been confirmed and sent to your KPay account.\nKPay Name: ${withdrawal.kpayName}\nKPay Number: ${withdrawal.kpayNumber}\nNew balance: ${user.balance} MMK.`,
       { parse_mode: 'Markdown' }
     );
 
@@ -821,7 +747,7 @@ app.post('/api/admin/reject-withdrawal', async (req, res) => {
     await withdrawal.save();
 
     await bot.telegram.sendMessage(withdrawal.userId, 
-      `❌ *Withdrawal Rejected*\n\nYour withdrawal request of ${withdrawal.amount} MMK has been rejected.\nReason: ${reason || 'Please contact admin for details.'}\n\nPlease check and try again.`,
+      `❌ *Withdrawal Rejected*\n\nYour withdrawal request of ${withdrawal.amount} MMK has been rejected.\nReason: ${reason || 'Please contact admin for details.'}`,
       { parse_mode: 'Markdown' }
     );
 
@@ -832,58 +758,22 @@ app.post('/api/admin/reject-withdrawal', async (req, res) => {
   }
 });
 
-app.get('/api/admin/stats', async (req, res) => {
-  try {
-    const { adminId } = req.query;
-    if (parseInt(adminId) !== ADMIN_ID) {
-      return res.status(403).json({ error: 'Unauthorized' });
-    }
-
-    const totalUsers = await User.countDocuments();
-    const totalDeposits = await Deposit.countDocuments({ status: 'confirmed' });
-    const totalDepositAmount = await Deposit.aggregate([
-      { $match: { status: 'confirmed' } },
-      { $group: { _id: null, total: { $sum: '$amount' } } }
-    ]);
-    const totalWithdrawals = await Withdrawal.countDocuments({ status: 'confirmed' });
-    const totalWithdrawalAmount = await Withdrawal.aggregate([
-      { $match: { status: 'confirmed' } },
-      { $group: { _id: null, total: { $sum: '$amount' } } }
-    ]);
-
-    res.json({
-      totalUsers,
-      totalDeposits,
-      totalDepositAmount: totalDepositAmount[0]?.total || 0,
-      totalWithdrawals,
-      totalWithdrawalAmount: totalWithdrawalAmount[0]?.total || 0
-    });
-  } catch (error) {
-    console.error('Stats error:', error);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
 // ==================== Socket.io Game Logic ====================
-const turnTimers = new Map();
 const gameTurnTimeouts = new Map();
 const activeGames = new Map();
 
-io.use((socket, next) => {
-  const token = socket.handshake.auth.token;
-  if (!token) return next(new Error('Authentication error'));
-  socket.userId = parseInt(token);
-  next();
-});
-
 io.on('connection', (socket) => {
-  console.log('👤 User connected:', socket.userId);
+  console.log('👤 User connected:', socket.id);
 
   socket.on('findGame', async () => {
     try {
-      const userId = socket.userId;
+      const userId = socket.handshake.auth.token;
+      if (!userId) {
+        socket.emit('error', 'Authentication required');
+        return;
+      }
 
-      const user = await User.findOne({ telegramId: userId });
+      const user = await User.findOne({ telegramId: parseInt(userId) });
       if (!user || user.balance < 1000) {
         socket.emit('error', 'Insufficient balance to play.');
         return;
@@ -896,7 +786,7 @@ io.on('connection', (socket) => {
       const gameId = generateGameId();
       const game = new Game({
         gameId,
-        players: [userId],
+        players: [parseInt(userId)],
         status: 'waiting'
       });
       await game.save();
@@ -912,11 +802,10 @@ io.on('connection', (socket) => {
           if (!gameStillWaiting) return;
 
           if (gameStillWaiting.players.length === 1) {
-            gameStillWaiting.players.push(0);
+            gameStillWaiting.players.push(0); // Bot
             gameStillWaiting.status = 'active';
             gameStillWaiting.currentTurn = gameStillWaiting.players[0];
             gameStillWaiting.gameStartTime = new Date();
-            gameStillWaiting.lastMoveTime = new Date();
             gameStillWaiting.turnStartTime = new Date();
             gameStillWaiting.isBotGame = true;
             await gameStillWaiting.save();
@@ -952,7 +841,8 @@ io.on('connection', (socket) => {
         return socket.emit('error', 'Game not active');
       }
 
-      if (game.currentTurn !== socket.userId) {
+      const userId = socket.handshake.auth.token;
+      if (game.currentTurn !== parseInt(userId)) {
         return socket.emit('error', 'Not your turn');
       }
 
@@ -972,20 +862,6 @@ io.on('connection', (socket) => {
         
         clearTurnTimer(gameId);
         
-        if (winner !== 0) {
-          const winnerUser = await User.findOne({ telegramId: winner });
-          if (winnerUser) {
-            winnerUser.wins += 1;
-            await winnerUser.save();
-          }
-        }
-        
-        const loserUser = await User.findOne({ telegramId: loser });
-        if (loserUser) {
-          loserUser.losses += 1;
-          await loserUser.save();
-        }
-        
         io.to(gameId).emit('gameOver', { 
           winner, 
           board: game.board,
@@ -996,26 +872,20 @@ io.on('connection', (socket) => {
         return;
       }
 
-      const symbol = socket.userId === game.players[0] ? 'X' : 'O';
+      const symbol = parseInt(userId) === game.players[0] ? 'X' : 'O';
       game.board[row][col] = symbol;
       game.lastMoveTime = now;
       game.turnStartTime = now;
 
       if (ai.checkWin(game.board, symbol)) {
-        game.winner = socket.userId;
+        game.winner = parseInt(userId);
         game.status = 'completed';
         await game.save();
         
         clearTurnTimer(gameId);
         
-        const winnerUser = await User.findOne({ telegramId: socket.userId });
-        if (winnerUser) {
-          winnerUser.wins += 1;
-          await winnerUser.save();
-        }
-        
         io.to(gameId).emit('gameOver', { 
-          winner: socket.userId, 
+          winner: parseInt(userId), 
           board: game.board,
           reason: 'win'
         });
@@ -1042,7 +912,7 @@ io.on('connection', (socket) => {
         return;
       }
 
-      game.currentTurn = game.players.find(p => p !== socket.userId);
+      game.currentTurn = game.players.find(p => p !== parseInt(userId));
       game.turnStartTime = new Date();
       await game.save();
 
@@ -1076,37 +946,10 @@ io.on('connection', (socket) => {
                   
                   clearTurnTimer(gameId);
                   
-                  const humanId = currentGame.players.find(p => p !== 0);
-                  if (humanId) {
-                    const humanUser = await User.findOne({ telegramId: humanId });
-                    if (humanUser) {
-                      humanUser.losses += 1;
-                      await humanUser.save();
-                    }
-                  }
-                  
                   io.to(gameId).emit('gameOver', { 
                     winner: 0, 
                     board: currentGame.board,
                     reason: 'bot_win'
-                  });
-                  
-                  await handleGameEnd(currentGame);
-                  return;
-                }
-
-                const isBoardFull = currentGame.board.every(row => row.every(cell => cell !== ''));
-                if (isBoardFull) {
-                  currentGame.winner = -1;
-                  currentGame.status = 'completed';
-                  await currentGame.save();
-                  
-                  clearTurnTimer(gameId);
-                  
-                  io.to(gameId).emit('gameOver', { 
-                    winner: -1, 
-                    board: currentGame.board,
-                    reason: 'draw'
                   });
                   
                   await handleGameEnd(currentGame);
@@ -1136,19 +979,8 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('playAgain', async ({ gameId }) => {
-    try {
-      const game = await Game.findOne({ gameId });
-      if (!game) return;
-
-      socket.emit('findGame');
-    } catch (error) {
-      console.error('Play again error:', error);
-    }
-  });
-
   socket.on('disconnect', () => {
-    console.log('👋 User disconnected:', socket.userId);
+    console.log('👋 User disconnected:', socket.id);
   });
 });
 
@@ -1166,20 +998,6 @@ function startTurnTimer(gameId) {
           game.winner = winner;
           game.status = 'completed';
           await game.save();
-          
-          if (winner !== 0) {
-            const winnerUser = await User.findOne({ telegramId: winner });
-            if (winnerUser) {
-              winnerUser.wins += 1;
-              await winnerUser.save();
-            }
-          }
-          
-          const loserUser = await User.findOne({ telegramId: loser });
-          if (loserUser) {
-            loserUser.losses += 1;
-            await loserUser.save();
-          }
           
           io.to(gameId).emit('gameOver', { 
             winner, 
@@ -1223,20 +1041,22 @@ async function handleGameEnd(game) {
       const winner = await User.findOne({ telegramId: game.winner });
       if (winner) {
         winner.balance += 1600;
+        winner.wins += 1;
         await winner.save();
         
         await bot.telegram.sendMessage(game.winner, 
-          `🎉 *You Won!*\n\nCongratulations! You won the game!\nYou received 1600 MMK.\nNew balance: ${winner.balance} MMK.\n\nPlay again to win more!`,
+          `🎉 *You Won!*\n\nYou received 1600 MMK.\nNew balance: ${winner.balance} MMK.`,
           { parse_mode: 'Markdown' }
         );
       }
       
       const loserId = game.players.find(p => p !== game.winner && p !== 0);
       if (loserId) {
-        await bot.telegram.sendMessage(loserId, 
-          `😢 *Game Over*\n\nYou lost the game. Better luck next time!\nPlay again to win back your losses.`,
-          { parse_mode: 'Markdown' }
-        );
+        const loser = await User.findOne({ telegramId: loserId });
+        if (loser) {
+          loser.losses += 1;
+          await loser.save();
+        }
       }
     } else if (game.winner === -1) {
       for (let playerId of game.players) {
@@ -1245,20 +1065,8 @@ async function handleGameEnd(game) {
           if (user) {
             user.balance += 500;
             await user.save();
-            await bot.telegram.sendMessage(playerId, 
-              `🤝 *Game Draw*\n\nThe game ended in a draw.\nYou received 500 MMK refund.\nNew balance: ${user.balance} MMK.\n\nPlay again to win more!`,
-              { parse_mode: 'Markdown' }
-            );
           }
         }
-      }
-    } else if (game.winner === 0) {
-      const humanId = game.players.find(p => p !== 0);
-      if (humanId) {
-        await bot.telegram.sendMessage(humanId, 
-          `🤖 *Game Over*\n\nYou lost to the AI. Better luck next time!\nPlay again to challenge the AI.`,
-          { parse_mode: 'Markdown' }
-        );
       }
     }
 
@@ -1274,38 +1082,24 @@ async function handleGameEnd(game) {
   }
 }
 
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    mongodb: isConnected ? 'connected' : 'disconnected',
-    activeURI: activeConnectionString ? activeConnectionString.substring(0, 25) + '...' : 'none',
-    uptime: process.uptime(),
-    env: {
-      botToken: BOT_TOKEN ? '✅ Set' : '❌ Not set',
-      adminId: ADMIN_ID ? '✅ Set' : '❌ Not set',
-      mongodb1: MONGODB_URI1 ? '✅ Set' : '❌ Not set',
-      mongodb2: MONGODB_URI2 ? '✅ Set' : '❌ Not set'
-    }
-  });
-});
-
+// ==================== Start Server ====================
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ Server running on port ${PORT}`);
   console.log(`🌐 Frontend URL: https://tictokfrontend.vercel.app`);
   console.log(`🤖 Bot URL: https://t.me/tictoe1_bot`);
-  console.log(`🔍 Health check: http://localhost:${PORT}/health`);
+  console.log(`🔍 Health check: https://tiktocbackend.onrender.com/health`);
 });
 
 // Graceful shutdown
 process.on('SIGTERM', async () => {
   console.log('SIGTERM received. Closing connections...');
   
-  for (const [gameId, timeout] of gameTurnTimeouts) {
+  for (const timeout of gameTurnTimeouts.values()) {
     clearTimeout(timeout);
   }
   
-  for (const [gameId, gameData] of activeGames) {
+  for (const gameData of activeGames.values()) {
     if (gameData.timeout) {
       clearTimeout(gameData.timeout);
     }
