@@ -3,166 +3,75 @@ const { Telegraf } = require('telegraf');
 const { Server } = require('socket.io');
 const http = require('http');
 const mongoose = require('mongoose');
-const crypto = require('crypto');
 const dotenv = require('dotenv');
-const cors = require('cors');
 
-// Load environment variables
 dotenv.config();
 
 const app = express();
 const server = http.createServer(app);
 
-// ==================== CORS Configuration ====================
-// Simple CORS - အရင်ဆုံး ဒီလိုစမ်းပါ
+// ==================== CORS ====================
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
-  
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(200);
-  }
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
 
 app.use(express.json());
 
-// ==================== Socket.io with CORS ====================
+// ==================== Socket.io ====================
 const io = new Server(server, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"],
-    credentials: true,
-    transports: ['websocket', 'polling']
-  },
-  allowEIO3: true
+  cors: { origin: '*', methods: ['GET', 'POST'] },
+  allowEIO3: true,
+  transports: ['websocket', 'polling']
 });
 
-// ==================== Environment Variables Validation ====================
+// ==================== Env Validation ====================
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_ID = process.env.ADMIN_ID ? parseInt(process.env.ADMIN_ID) : null;
 const MONGODB_URI1 = process.env.MONGODB_URI1;
 const MONGODB_URI2 = process.env.MONGODB_URI2;
 
-console.log('🔍 Checking environment variables...');
-console.log(`- BOT_TOKEN: ${BOT_TOKEN ? '✅ Set' : '❌ Not set'}`);
-console.log(`- ADMIN_ID: ${ADMIN_ID ? '✅ Set' : '❌ Not set'}`);
-console.log(`- MONGODB_URI1: ${MONGODB_URI1 ? '✅ Set' : '❌ Not set'}`);
-console.log(`- MONGODB_URI2: ${MONGODB_URI2 ? '✅ Set' : '❌ Not set'}`);
-
-// Validate required environment variables
-if (!BOT_TOKEN) {
-  console.error('❌ BOT_TOKEN is not set in environment variables');
+if (!BOT_TOKEN || !ADMIN_ID || !MONGODB_URI1) {
+  console.error('❌ Missing required environment variables');
   process.exit(1);
 }
 
-if (!ADMIN_ID) {
-  console.error('❌ ADMIN_ID is not set in environment variables');
-  process.exit(1);
-}
-
-if (!MONGODB_URI1) {
-  console.error('❌ MONGODB_URI1 is not set in environment variables');
-  process.exit(1);
-}
-
-// ==================== MongoDB Connection with Failover ====================
+// ==================== MongoDB ====================
 let isConnected = false;
-let activeConnectionString = MONGODB_URI1;
-let reconnectTimer = null;
 
-const connectWithFailover = async (retryCount = 0) => {
-  const maxRetries = 5;
-  const baseDelay = 5000;
-
-  const connectToURI = async (uri) => {
-    if (!uri) {
-      console.error('❌ MongoDB URI is undefined or null');
-      return null;
-    }
-
+const connectDB = async () => {
+  const uris = [MONGODB_URI1, MONGODB_URI2].filter(Boolean);
+  for (const uri of uris) {
     try {
-      console.log(`🔄 Attempting to connect to MongoDB...`);
-      
-      if (mongoose.connection.readyState !== 0) {
-        await mongoose.disconnect();
-      }
-
-      const conn = await mongoose.connect(uri, {
-        useNewUrlParser: true,
-        useUnifiedTopology: true,
+      if (mongoose.connection.readyState !== 0) await mongoose.disconnect();
+      await mongoose.connect(uri, {
         serverSelectionTimeoutMS: 10000,
         socketTimeoutMS: 45000,
       });
-
-      console.log(`✅ Connected to MongoDB successfully`);
-      return conn;
-    } catch (error) {
-      console.error(`❌ Failed to connect to MongoDB:`, error.message);
-      return null;
-    }
-  };
-
-  // Try primary URI
-  let connection = null;
-  
-  if (MONGODB_URI1) {
-    connection = await connectToURI(MONGODB_URI1);
-  }
-  
-  // If primary fails and secondary exists, try secondary
-  if (!connection && MONGODB_URI2) {
-    console.log('⚠️ Primary connection failed, switching to secondary...');
-    connection = await connectToURI(MONGODB_URI2);
-    if (connection) {
-      activeConnectionString = MONGODB_URI2;
-      console.log('✅ Successfully failed over to secondary MongoDB');
+      isConnected = true;
+      console.log('✅ MongoDB connected');
+      return;
+    } catch (e) {
+      console.error('❌ MongoDB connect failed:', e.message);
     }
   }
-
-  if (!connection) {
-    console.error('❌ All MongoDB connections failed.');
-    
-    if (retryCount < maxRetries) {
-      const delay = baseDelay * Math.pow(2, retryCount);
-      console.log(`⏰ Retrying in ${delay/1000} seconds... (Attempt ${retryCount + 1}/${maxRetries})`);
-      
-      reconnectTimer = setTimeout(() => {
-        connectWithFailover(retryCount + 1);
-      }, delay);
-    } else {
-      console.error('❌ Max retries reached. Continuing without database...');
-    }
-    return;
-  }
-
-  isConnected = true;
-
-  // Monitor connection events
-  mongoose.connection.on('disconnected', () => {
-    console.log('❌ MongoDB disconnected!');
-    isConnected = false;
-  });
-
-  mongoose.connection.on('error', (err) => {
-    console.error('MongoDB error:', err);
-    isConnected = false;
-  });
-
-  mongoose.connection.on('reconnected', () => {
-    console.log('✅ MongoDB reconnected');
-    isConnected = true;
-  });
+  console.error('❌ All MongoDB URIs failed, retrying in 10s...');
+  setTimeout(connectDB, 10000);
 };
 
-// Initialize connection
-connectWithFailover();
+mongoose.connection.on('disconnected', () => { isConnected = false; });
+mongoose.connection.on('reconnected', () => { isConnected = true; });
 
-// ==================== MongoDB Schemas ====================
+connectDB();
+
+// ==================== Schemas ====================
 const userSchema = new mongoose.Schema({
   telegramId: { type: Number, required: true, unique: true },
   username: String,
+  firstName: String,
   balance: { type: Number, default: 0 },
   referredBy: { type: Number, default: null },
   referralCode: { type: String, unique: true },
@@ -195,10 +104,9 @@ const withdrawalSchema = new mongoose.Schema({
 const gameSchema = new mongoose.Schema({
   gameId: { type: String, required: true, unique: true },
   players: [{ type: Number }],
-  board: { type: [[String]], default: () => Array(5).fill().map(() => Array(5).fill('')) },
+  board: { type: mongoose.Schema.Types.Mixed, default: () => Array(5).fill(null).map(() => Array(5).fill('')) },
   currentTurn: { type: Number, default: null },
   gameStartTime: { type: Date, default: Date.now },
-  lastMoveTime: { type: Date, default: Date.now },
   turnStartTime: { type: Date, default: Date.now },
   winner: { type: Number, default: null },
   status: { type: String, enum: ['waiting', 'active', 'completed'], default: 'waiting' },
@@ -210,16 +118,23 @@ const Deposit = mongoose.model('Deposit', depositSchema);
 const Withdrawal = mongoose.model('Withdrawal', withdrawalSchema);
 const Game = mongoose.model('Game', gameSchema);
 
-// ==================== Helper Functions ====================
+// ==================== Helpers ====================
 function generateReferralCode(telegramId) {
   return 'TIC' + telegramId.toString(36).toUpperCase() + Math.random().toString(36).substr(2, 4).toUpperCase();
 }
 
+// FIX: Accept initData OR direct telegramId for dev/testing fallback
 function validateInitData(initData) {
+  if (!initData) return null;
   try {
+    // Standard Telegram initData format
     const urlParams = new URLSearchParams(initData);
-    const user = JSON.parse(urlParams.get('user'));
-    return user;
+    const userStr = urlParams.get('user');
+    if (userStr) {
+      return JSON.parse(userStr);
+    }
+    // Fallback: try parsing as direct JSON (for testing)
+    return JSON.parse(initData);
   } catch (e) {
     return null;
   }
@@ -229,302 +144,232 @@ function generateGameId() {
   return 'game_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
 }
 
-// ==================== Minimax AI ====================
+// ==================== AI (Heuristic - fast) ====================
 class TicTacToeAI {
-  constructor() {
-    this.boardSize = 5;
-    this.winLength = 4;
-  }
-
   checkWin(board, symbol) {
-    // Check rows
     for (let i = 0; i < 5; i++) {
       for (let j = 0; j <= 1; j++) {
-        if (board[i][j] === symbol && 
-            board[i][j+1] === symbol && 
-            board[i][j+2] === symbol && 
-            board[i][j+3] === symbol) {
-          return true;
-        }
+        if (board[i][j] === symbol && board[i][j+1] === symbol && board[i][j+2] === symbol && board[i][j+3] === symbol) return true;
       }
     }
-
-    // Check columns
     for (let i = 0; i <= 1; i++) {
       for (let j = 0; j < 5; j++) {
-        if (board[i][j] === symbol && 
-            board[i+1][j] === symbol && 
-            board[i+2][j] === symbol && 
-            board[i+3][j] === symbol) {
-          return true;
-        }
+        if (board[i][j] === symbol && board[i+1][j] === symbol && board[i+2][j] === symbol && board[i+3][j] === symbol) return true;
       }
     }
-
-    // Check diagonals
     for (let i = 0; i <= 1; i++) {
       for (let j = 0; j <= 1; j++) {
-        if (board[i][j] === symbol && 
-            board[i+1][j+1] === symbol && 
-            board[i+2][j+2] === symbol && 
-            board[i+3][j+3] === symbol) {
-          return true;
-        }
+        if (board[i][j] === symbol && board[i+1][j+1] === symbol && board[i+2][j+2] === symbol && board[i+3][j+3] === symbol) return true;
       }
     }
-
     for (let i = 0; i <= 1; i++) {
       for (let j = 3; j < 5; j++) {
-        if (board[i][j] === symbol && 
-            board[i+1][j-1] === symbol && 
-            board[i+2][j-2] === symbol && 
-            board[i+3][j-3] === symbol) {
-          return true;
-        }
+        if (board[i][j] === symbol && board[i+1][j-1] === symbol && board[i+2][j-2] === symbol && board[i+3][j-3] === symbol) return true;
       }
     }
-
     return false;
   }
 
-  getEmptyCells(board) {
-    const empty = [];
-    for (let i = 0; i < 5; i++) {
-      for (let j = 0; j < 5; j++) {
-        if (board[i][j] === '') empty.push([i, j]);
+  scoreCell(board, row, col, symbol) {
+    let score = 0;
+    const dirs = [[0,1],[1,0],[1,1],[1,-1]];
+    for (const [dr, dc] of dirs) {
+      let count = 1, blocked = 0;
+      for (let k = 1; k < 4; k++) {
+        const r = row + dr*k, c = col + dc*k;
+        if (r < 0 || r >= 5 || c < 0 || c >= 5) { blocked++; break; }
+        if (board[r][c] === symbol) count++;
+        else if (board[r][c] !== '') { blocked++; break; }
+        else break;
       }
+      for (let k = 1; k < 4; k++) {
+        const r = row - dr*k, c = col - dc*k;
+        if (r < 0 || r >= 5 || c < 0 || c >= 5) { blocked++; break; }
+        if (board[r][c] === symbol) count++;
+        else if (board[r][c] !== '') { blocked++; break; }
+        else break;
+      }
+      if (count >= 4) score += 10000;
+      else if (count === 3 && blocked === 0) score += 500;
+      else if (count === 3) score += 100;
+      else if (count === 2 && blocked === 0) score += 50;
     }
-    return empty;
-  }
-
-  minimax(board, depth, isMaximizing, player, opponent, alpha, beta) {
-    if (this.checkWin(board, player)) return 100 - depth;
-    if (this.checkWin(board, opponent)) return -100 + depth;
-    
-    const emptyCells = this.getEmptyCells(board);
-    if (emptyCells.length === 0) return 0;
-
-    if (isMaximizing) {
-      let best = -Infinity;
-      for (let [row, col] of emptyCells) {
-        board[row][col] = player;
-        best = Math.max(best, this.minimax(board, depth + 1, false, player, opponent, alpha, beta));
-        board[row][col] = '';
-        alpha = Math.max(alpha, best);
-        if (beta <= alpha) break;
-      }
-      return best;
-    } else {
-      let best = Infinity;
-      for (let [row, col] of emptyCells) {
-        board[row][col] = opponent;
-        best = Math.min(best, this.minimax(board, depth + 1, true, player, opponent, alpha, beta));
-        board[row][col] = '';
-        beta = Math.min(beta, best);
-        if (beta <= alpha) break;
-      }
-      return best;
-    }
+    return score;
   }
 
   getBestMove(board, currentPlayer) {
-    const player = currentPlayer;
     const opponent = currentPlayer === 'X' ? 'O' : 'X';
+    let best = -1, bestMove = null;
+    const empty = [];
+    for (let i = 0; i < 5; i++)
+      for (let j = 0; j < 5; j++)
+        if (board[i][j] === '') empty.push([i, j]);
     
-    let bestScore = -Infinity;
-    let bestMove = null;
+    if (empty.length === 25) return [2, 2]; // Start center
     
-    const emptyCells = this.getEmptyCells(board);
-    
-    for (let [row, col] of emptyCells) {
-      board[row][col] = player;
-      let moveScore = this.minimax(board, 0, false, player, opponent, -Infinity, Infinity);
-      board[row][col] = '';
-      
-      if (moveScore > bestScore) {
-        bestScore = moveScore;
-        bestMove = [row, col];
-      }
+    for (const [r, c] of empty) {
+      board[r][c] = currentPlayer;
+      const attackScore = this.scoreCell(board, r, c, currentPlayer);
+      board[r][c] = '';
+      board[r][c] = opponent;
+      const defenseScore = this.scoreCell(board, r, c, opponent);
+      board[r][c] = '';
+      const score = Math.max(attackScore, defenseScore * 0.9);
+      if (score > best) { best = score; bestMove = [r, c]; }
     }
-    
-    return bestMove;
+    return bestMove || empty[Math.floor(Math.random() * empty.length)];
   }
 }
 
 const ai = new TicTacToeAI();
 
-// ==================== Bot Setup ====================
-const bot = new Telegraf(BOT_TOKEN);
+// ==================== Bot ====================
+let bot;
+try {
+  bot = new Telegraf(BOT_TOKEN);
 
-bot.start(async (ctx) => {
-  const userId = ctx.from.id;
-  const args = ctx.payload;
-  
-  try {
-    let user = await User.findOne({ telegramId: userId });
-    
-    if (!user) {
-      user = new User({
-        telegramId: userId,
-        username: ctx.from.username,
-        referralCode: generateReferralCode(userId)
-      });
-      
-      if (args) {
-        const referrer = await User.findOne({ referralCode: args });
-        if (referrer) {
-          user.referredBy = referrer.telegramId;
+  bot.start(async (ctx) => {
+    const userId = ctx.from.id;
+    const args = ctx.payload;
+    try {
+      let user = await User.findOne({ telegramId: userId });
+      if (!user) {
+        user = new User({
+          telegramId: userId,
+          username: ctx.from.username || '',
+          firstName: ctx.from.first_name || '',
+          referralCode: generateReferralCode(userId)
+        });
+        if (args) {
+          const referrer = await User.findOne({ referralCode: args });
+          if (referrer && referrer.telegramId !== userId) {
+            user.referredBy = referrer.telegramId;
+          }
         }
+        await user.save();
       }
-      
-      await user.save();
-    }
-
-    const webAppUrl = 'https://tictokfrontend.vercel.app';
-    ctx.reply('🎮 ဂိမ်းကစားရန် PLAY ကိုနှိပ်ပါ', {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: '🎮 PLAY GAME', web_app: { url: webAppUrl } }],
-          [{ text: '🔗 Referral Link', callback_data: 'referral' }],
-          [{ text: '💰 Balance', callback_data: 'balance' }]
-        ]
-      }
-    });
-  } catch (error) {
-    console.error('Bot start error:', error);
-    ctx.reply('⚠️ Service temporarily unavailable. Please try again later.');
-  }
-});
-
-bot.action('referral', async (ctx) => {
-  try {
-    const user = await User.findOne({ telegramId: ctx.from.id });
-    if (user) {
-      const botUsername = ctx.botInfo.username;
-      ctx.reply(`🔗 Your referral link:\nhttps://t.me/${botUsername}?start=${user.referralCode}\n\nWhen your friend deposits 1000 MMK, you get 100 MMK!`, {
+      const webAppUrl = 'https://tictokfrontend.vercel.app';
+      ctx.reply(`🎮 မင်္ဂလာပါ ${ctx.from.first_name}!\n\n💰 လက်ကျန်: ${user.balance} MMK\n\nကစားရန် PLAY ကိုနှိပ်ပါ 👇`, {
         reply_markup: {
           inline_keyboard: [
-            [{ text: '🔙 Back', callback_data: 'back_to_main' }]
+            [{ text: '🎮 PLAY GAME', web_app: { url: webAppUrl } }],
+            [{ text: '💰 Balance', callback_data: 'balance' }, { text: '🔗 Referral', callback_data: 'referral' }]
           ]
         }
       });
+    } catch (error) {
+      console.error('Bot start error:', error);
+      ctx.reply('⚠️ ဝန်ဆောင်မှု ယာယီရပ်နားနေပါသည်။ ခဏနေ ပြန်ကြိုးစားပါ။');
     }
-  } catch (error) {
-    console.error('Referral action error:', error);
-    ctx.reply('⚠️ Error fetching referral info');
-  }
-});
+  });
 
-bot.action('balance', async (ctx) => {
-  try {
-    const user = await User.findOne({ telegramId: ctx.from.id });
-    if (user) {
-      ctx.reply(`💰 Your balance: ${user.balance} MMK`, {
+  bot.action('referral', async (ctx) => {
+    try {
+      const user = await User.findOne({ telegramId: ctx.from.id });
+      if (user) {
+        const botUsername = ctx.botInfo?.username || 'tictoe1_bot';
+        await ctx.answerCbQuery();
+        ctx.reply(`🔗 သင့် Referral Link:\nhttps://t.me/${botUsername}?start=${user.referralCode}\n\nမိတ်ဆွေတစ်ဦး 1000 MMK ဖြည့်တိုင်း 100 MMK ရမည်!`);
+      }
+    } catch (e) { ctx.answerCbQuery(); }
+  });
+
+  bot.action('balance', async (ctx) => {
+    try {
+      const user = await User.findOne({ telegramId: ctx.from.id });
+      if (user) {
+        await ctx.answerCbQuery();
+        ctx.reply(`💰 လက်ကျန်ငွေ: ${user.balance} MMK\n🎮 ကစားမှုအရေအတွက်: ${user.totalGames}\n🏆 နိုင်မှု: ${user.wins} | ရှုံးမှု: ${user.losses}`);
+      }
+    } catch (e) { ctx.answerCbQuery(); }
+  });
+
+  bot.command('admin', (ctx) => {
+    if (ctx.from.id === ADMIN_ID) {
+      ctx.reply('👑 Admin Panel', {
         reply_markup: {
-          inline_keyboard: [
-            [{ text: '🔙 Back', callback_data: 'back_to_main' }]
-          ]
+          inline_keyboard: [[{ text: '⚙️ Admin Panel', web_app: { url: 'https://tictokfrontend.vercel.app/admin.html' } }]]
         }
       });
+    } else {
+      ctx.reply('⛔ ခွင့်ပြုချက်မရှိပါ။');
     }
-  } catch (error) {
-    console.error('Balance action error:', error);
-    ctx.reply('⚠️ Error fetching balance');
-  }
-});
+  });
 
-bot.action('back_to_main', async (ctx) => {
-  ctx.deleteMessage();
-  bot.start(ctx);
-});
-
-bot.command('admin', (ctx) => {
-  const userId = ctx.from.id;
-  if (userId === ADMIN_ID) {
-    const adminWebAppUrl = 'https://tictokfrontend.vercel.app/admin.html';
-    ctx.reply('👑 Admin Panel သို့ဝင်ရန်', {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: '⚙️ Admin Panel', web_app: { url: adminWebAppUrl } }]
-        ]
-      }
-    });
-  } else {
-    ctx.reply('⛔ You are not authorized.');
-  }
-});
-
-bot.launch().then(() => console.log('✅ Bot started')).catch(err => {
-  console.error('❌ Bot failed to start:', err);
-});
+  bot.launch().then(() => console.log('✅ Bot started')).catch(err => console.error('❌ Bot failed:', err));
+} catch (e) {
+  console.error('Bot init error:', e);
+}
 
 // ==================== API Routes ====================
-// Health check endpoint
-app.get('/', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    message: 'TicToeTic Backend is running',
-    time: new Date().toISOString()
-  });
-});
+app.get('/', (req, res) => res.json({ status: 'ok', message: 'TicToeTic Backend', time: new Date() }));
 
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    mongodb: isConnected ? 'connected' : 'disconnected',
-    uptime: process.uptime(),
-    env: {
-      botToken: BOT_TOKEN ? '✅ Set' : '❌ Not set',
-      adminId: ADMIN_ID ? '✅ Set' : '❌ Not set',
-      mongodb1: MONGODB_URI1 ? '✅ Set' : '❌ Not set',
-      mongodb2: MONGODB_URI2 ? '✅ Set' : '❌ Not set'
-    }
-  });
-});
+app.get('/health', (req, res) => res.json({
+  status: 'ok',
+  mongodb: isConnected ? 'connected' : 'disconnected',
+  uptime: process.uptime()
+}));
 
+// AUTH - FIX: Better error handling + dev mode fallback
 app.post('/api/auth', async (req, res) => {
   try {
-    const { initData } = req.body;
-    const userData = validateInitData(initData);
-    if (!userData) {
-      return res.status(401).json({ error: 'Invalid init data' });
+    const { initData, telegramId: directId } = req.body;
+    
+    let telegramId, username, firstName;
+    
+    if (directId) {
+      // Dev mode / direct ID
+      telegramId = parseInt(directId);
+      username = 'User' + telegramId;
+      firstName = 'User';
+    } else {
+      const userData = validateInitData(initData);
+      if (!userData) {
+        return res.status(401).json({ error: 'Invalid Telegram auth data. Please open from Telegram.' });
+      }
+      telegramId = userData.id;
+      username = userData.username || '';
+      firstName = userData.first_name || '';
     }
-
-    const { id: telegramId, username } = userData;
 
     let user = await User.findOne({ telegramId });
     if (!user) {
-      user = new User({ 
-        telegramId, 
+      user = new User({
+        telegramId,
         username,
+        firstName,
         referralCode: generateReferralCode(telegramId)
       });
       await user.save();
-    } else if (username && user.username !== username) {
-      user.username = username;
-      await user.save();
+    } else {
+      let changed = false;
+      if (username && user.username !== username) { user.username = username; changed = true; }
+      if (firstName && user.firstName !== firstName) { user.firstName = firstName; changed = true; }
+      if (changed) await user.save();
     }
 
-    res.json({ 
-      telegramId: user.telegramId, 
-      username: user.username, 
+    res.json({
+      telegramId: user.telegramId,
+      username: user.username || user.firstName || 'User',
+      firstName: user.firstName,
       balance: user.balance,
-      referralCode: user.referralCode
+      referralCode: user.referralCode,
+      totalGames: user.totalGames,
+      wins: user.wins,
+      losses: user.losses
     });
   } catch (error) {
     console.error('Auth error:', error);
-    res.status(500).json({ error: 'Server error' });
+    res.status(500).json({ error: 'Server error: ' + error.message });
   }
 });
 
 app.get('/api/user/:telegramId', async (req, res) => {
   try {
-    const { telegramId } = req.params;
-    const user = await User.findOne({ telegramId: parseInt(telegramId) });
+    const user = await User.findOne({ telegramId: parseInt(req.params.telegramId) });
     if (!user) return res.status(404).json({ error: 'User not found' });
-    res.json({ balance: user.balance });
+    res.json({ balance: user.balance, totalGames: user.totalGames, wins: user.wins, losses: user.losses });
   } catch (error) {
-    console.error('Get user error:', error);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -532,98 +377,108 @@ app.get('/api/user/:telegramId', async (req, res) => {
 app.post('/api/deposit', async (req, res) => {
   try {
     const { telegramId, kpayName, transactionId, amount } = req.body;
-    if (amount < 1000) {
-      return res.status(400).json({ error: 'Minimum deposit amount is 1000' });
+    if (!telegramId || !kpayName || !transactionId || !amount) {
+      return res.status(400).json({ error: 'ကွင်းအားလုံး ဖြည့်ပါ' });
     }
+    if (amount < 1000) return res.status(400).json({ error: 'အနည်းဆုံး 1000 MMK လိုပါသည်' });
 
     const user = await User.findOne({ telegramId: parseInt(telegramId) });
     if (!user) return res.status(404).json({ error: 'User not found' });
 
     const existing = await Deposit.findOne({ transactionId });
-    if (existing) return res.status(400).json({ error: 'Transaction ID already used' });
+    if (existing) return res.status(400).json({ error: 'Transaction ID ကိုအသုံးပြုပြီးပါပြီ' });
 
-    const deposit = new Deposit({
-      userId: user.telegramId,
-      kpayName,
-      transactionId,
-      amount
-    });
+    const deposit = new Deposit({ userId: user.telegramId, kpayName, transactionId, amount });
     await deposit.save();
 
-    await bot.telegram.sendMessage(ADMIN_ID, 
-      `💰 *New Deposit Request*\n\nUser: ${user.username || 'N/A'} (${user.telegramId})\nAmount: ${amount} MMK\nKPay Name: ${kpayName}\nTransaction ID: ${transactionId}`,
-      { parse_mode: 'Markdown' }
-    );
+    try {
+      await bot.telegram.sendMessage(ADMIN_ID,
+        `💰 *ငွေသွင်း တောင်းဆိုမှု*\n\nUser: ${user.username || user.firstName || 'N/A'} (${user.telegramId})\nပမာဏ: ${amount} MMK\nKPay Name: ${kpayName}\nTransaction ID: \`${transactionId}\``,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (e) { console.error('Bot notify error:', e.message); }
 
     res.json({ success: true, depositId: deposit._id });
   } catch (error) {
     console.error('Deposit error:', error);
-    res.status(500).json({ error: 'Server error' });
+    res.status(500).json({ error: 'Server error: ' + error.message });
   }
 });
 
 app.post('/api/withdraw', async (req, res) => {
   try {
     const { telegramId, kpayName, kpayNumber, amount } = req.body;
-    if (amount < 3000) {
-      return res.status(400).json({ error: 'Minimum withdrawal amount is 3000' });
+    if (!telegramId || !kpayName || !kpayNumber || !amount) {
+      return res.status(400).json({ error: 'ကွင်းအားလုံး ဖြည့်ပါ' });
     }
+    if (amount < 3000) return res.status(400).json({ error: 'အနည်းဆုံး 3000 MMK မှ ထုတ်ယူနိုင်သည်' });
 
     const user = await User.findOne({ telegramId: parseInt(telegramId) });
     if (!user) return res.status(404).json({ error: 'User not found' });
+    if (user.balance < amount) return res.status(400).json({ error: 'လက်ကျန်ငွေ မလုံလောက်ပါ' });
 
-    if (user.balance < amount) {
-      return res.status(400).json({ error: 'Insufficient balance' });
-    }
-
-    const withdrawal = new Withdrawal({
-      userId: user.telegramId,
-      kpayName,
-      kpayNumber,
-      amount
-    });
+    const withdrawal = new Withdrawal({ userId: user.telegramId, kpayName, kpayNumber, amount });
     await withdrawal.save();
 
-    await bot.telegram.sendMessage(ADMIN_ID,
-      `💸 *New Withdrawal Request*\n\nUser: ${user.username || 'N/A'} (${user.telegramId})\nAmount: ${amount} MMK\nKPay Name: ${kpayName}\nKPay Number: ${kpayNumber}`,
-      { parse_mode: 'Markdown' }
-    );
+    try {
+      await bot.telegram.sendMessage(ADMIN_ID,
+        `💸 *ငွေထုတ် တောင်းဆိုမှု*\n\nUser: ${user.username || user.firstName || 'N/A'} (${user.telegramId})\nပမာဏ: ${amount} MMK\nKPay Name: ${kpayName}\nKPay Number: ${kpayNumber}`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (e) { console.error('Bot notify error:', e.message); }
 
     res.json({ success: true, withdrawalId: withdrawal._id });
   } catch (error) {
     console.error('Withdrawal error:', error);
+    res.status(500).json({ error: 'Server error: ' + error.message });
+  }
+});
+
+// Admin routes
+app.get('/api/admin/pending', async (req, res) => {
+  try {
+    const { adminId } = req.query;
+    if (parseInt(adminId) !== ADMIN_ID) return res.status(403).json({ error: 'Unauthorized' });
+
+    const [deposits, withdrawals] = await Promise.all([
+      Deposit.find({ status: 'pending' }).sort({ createdAt: -1 }),
+      Withdrawal.find({ status: 'pending' }).sort({ createdAt: -1 })
+    ]);
+
+    const userIds = [...new Set([...deposits.map(d => d.userId), ...withdrawals.map(w => w.userId)])];
+    const users = await User.find({ telegramId: { $in: userIds } });
+    const userMap = users.reduce((acc, u) => ({ ...acc, [u.telegramId]: u }), {});
+
+    res.json({
+      deposits: deposits.map(d => ({ ...d.toObject(), username: userMap[d.userId]?.username || userMap[d.userId]?.firstName, userBalance: userMap[d.userId]?.balance })),
+      withdrawals: withdrawals.map(w => ({ ...w.toObject(), username: userMap[w.userId]?.username || userMap[w.userId]?.firstName, userBalance: userMap[w.userId]?.balance }))
+    });
+  } catch (error) {
     res.status(500).json({ error: 'Server error' });
   }
 });
 
-app.get('/api/admin/pending', async (req, res) => {
+app.get('/api/admin/stats', async (req, res) => {
   try {
     const { adminId } = req.query;
-    if (parseInt(adminId) !== ADMIN_ID) {
-      return res.status(403).json({ error: 'Unauthorized' });
-    }
+    if (parseInt(adminId) !== ADMIN_ID) return res.status(403).json({ error: 'Unauthorized' });
 
-    const deposits = await Deposit.find({ status: 'pending' }).sort({ createdAt: -1 });
-    const withdrawals = await Withdrawal.find({ status: 'pending' }).sort({ createdAt: -1 });
-    
-    const userIds = [...new Set([...deposits.map(d => d.userId), ...withdrawals.map(w => w.userId)])];
-    const users = await User.find({ telegramId: { $in: userIds } });
-    const userMap = users.reduce((acc, u) => ({ ...acc, [u.telegramId]: u }), {});
-    
-    res.json({ 
-      deposits: deposits.map(d => ({ 
-        ...d.toObject(), 
-        username: userMap[d.userId]?.username,
-        userBalance: userMap[d.userId]?.balance 
-      })),
-      withdrawals: withdrawals.map(w => ({ 
-        ...w.toObject(), 
-        username: userMap[w.userId]?.username,
-        userBalance: userMap[w.userId]?.balance 
-      }))
+    const [totalUsers, totalGames, pendingDeposits, pendingWithdrawals, confirmedDeposits] = await Promise.all([
+      User.countDocuments(),
+      Game.countDocuments({ status: 'completed' }),
+      Deposit.countDocuments({ status: 'pending' }),
+      Withdrawal.countDocuments({ status: 'pending' }),
+      Deposit.aggregate([{ $match: { status: 'confirmed' } }, { $group: { _id: null, total: { $sum: '$amount' } } }])
+    ]);
+
+    res.json({
+      totalUsers,
+      totalGames,
+      pendingDeposits,
+      pendingWithdrawals,
+      totalDeposited: confirmedDeposits[0]?.total || 0
     });
   } catch (error) {
-    console.error('Admin pending error:', error);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -631,53 +486,53 @@ app.get('/api/admin/pending', async (req, res) => {
 app.post('/api/admin/confirm-deposit', async (req, res) => {
   try {
     const { adminId, depositId } = req.body;
-    if (parseInt(adminId) !== ADMIN_ID) {
-      return res.status(403).json({ error: 'Unauthorized' });
-    }
+    if (parseInt(adminId) !== ADMIN_ID) return res.status(403).json({ error: 'Unauthorized' });
 
     const deposit = await Deposit.findById(depositId);
     if (!deposit) return res.status(404).json({ error: 'Deposit not found' });
+    if (deposit.status !== 'pending') return res.status(400).json({ error: 'Already processed' });
 
     deposit.status = 'confirmed';
     deposit.confirmedAt = new Date();
     await deposit.save();
 
     const user = await User.findOne({ telegramId: deposit.userId });
-    if (!user) return res.status(404).json({ error: 'User not found' });
+    if (user) {
+      user.balance += deposit.amount;
+      await user.save();
 
-    user.balance += deposit.amount;
-    await user.save();
-
-    // Handle referral bonus
-    if (user.referredBy) {
-      const referrer = await User.findOne({ telegramId: user.referredBy });
-      if (referrer) {
-        referrer.balance += 100;
-        await referrer.save();
-        await bot.telegram.sendMessage(referrer.telegramId, 
-          `🎉 You received 100 MMK referral bonus from @${user.username || user.telegramId}'s deposit of ${deposit.amount} MMK.\nNew balance: ${referrer.balance} MMK.`
-        );
+      // Referral bonus
+      if (user.referredBy) {
+        const referrer = await User.findOne({ telegramId: user.referredBy });
+        if (referrer) {
+          referrer.balance += 100;
+          await referrer.save();
+          try {
+            await bot.telegram.sendMessage(referrer.telegramId,
+              `🎉 မိတ်ဆွေ @${user.username || user.telegramId} ၏ ${deposit.amount} MMK ဖြည့်မှုအတွက် Referral ကြေး 100 MMK ရပါပြီ!\nလက်ကျန်: ${referrer.balance} MMK`
+            );
+          } catch (e) {}
+        }
       }
-    }
 
-    await bot.telegram.sendMessage(deposit.userId, 
-      `✅ *Deposit Confirmed*\n\nYour deposit of ${deposit.amount} MMK has been confirmed.\nNew balance: ${user.balance} MMK.`,
-      { parse_mode: 'Markdown' }
-    );
+      try {
+        await bot.telegram.sendMessage(deposit.userId,
+          `✅ *ငွေသွင်း အတည်ပြုပြီး*\n\n${deposit.amount} MMK ဖြည့်ပြီးပါပြီ!\nလက်ကျန်: ${user.balance} MMK`,
+          { parse_mode: 'Markdown' }
+        );
+      } catch (e) {}
+    }
 
     res.json({ success: true });
   } catch (error) {
-    console.error('Confirm deposit error:', error);
-    res.status(500).json({ error: 'Server error' });
+    res.status(500).json({ error: 'Server error: ' + error.message });
   }
 });
 
 app.post('/api/admin/reject-deposit', async (req, res) => {
   try {
     const { adminId, depositId, reason } = req.body;
-    if (parseInt(adminId) !== ADMIN_ID) {
-      return res.status(403).json({ error: 'Unauthorized' });
-    }
+    if (parseInt(adminId) !== ADMIN_ID) return res.status(403).json({ error: 'Unauthorized' });
 
     const deposit = await Deposit.findById(depositId);
     if (!deposit) return res.status(404).json({ error: 'Deposit not found' });
@@ -685,14 +540,15 @@ app.post('/api/admin/reject-deposit', async (req, res) => {
     deposit.status = 'rejected';
     await deposit.save();
 
-    await bot.telegram.sendMessage(deposit.userId, 
-      `❌ *Deposit Rejected*\n\nYour deposit of ${deposit.amount} MMK has been rejected.\nReason: ${reason || 'Please contact admin for details.'}`,
-      { parse_mode: 'Markdown' }
-    );
+    try {
+      await bot.telegram.sendMessage(deposit.userId,
+        `❌ *ငွေသွင်း ငြင်းပယ်ခံရသည်*\n\n${deposit.amount} MMK ငြင်းပယ်ခံရပါသည်.\nအကြောင်းပြချက်: ${reason || 'Admin ကိုဆက်သွယ်ပါ'}`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (e) {}
 
     res.json({ success: true });
   } catch (error) {
-    console.error('Reject deposit error:', error);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -700,19 +556,15 @@ app.post('/api/admin/reject-deposit', async (req, res) => {
 app.post('/api/admin/confirm-withdrawal', async (req, res) => {
   try {
     const { adminId, withdrawalId } = req.body;
-    if (parseInt(adminId) !== ADMIN_ID) {
-      return res.status(403).json({ error: 'Unauthorized' });
-    }
+    if (parseInt(adminId) !== ADMIN_ID) return res.status(403).json({ error: 'Unauthorized' });
 
     const withdrawal = await Withdrawal.findById(withdrawalId);
     if (!withdrawal) return res.status(404).json({ error: 'Withdrawal not found' });
+    if (withdrawal.status !== 'pending') return res.status(400).json({ error: 'Already processed' });
 
     const user = await User.findOne({ telegramId: withdrawal.userId });
     if (!user) return res.status(404).json({ error: 'User not found' });
-
-    if (user.balance < withdrawal.amount) {
-      return res.status(400).json({ error: 'Insufficient balance now' });
-    }
+    if (user.balance < withdrawal.amount) return res.status(400).json({ error: 'Insufficient balance' });
 
     user.balance -= withdrawal.amount;
     await user.save();
@@ -721,24 +573,23 @@ app.post('/api/admin/confirm-withdrawal', async (req, res) => {
     withdrawal.confirmedAt = new Date();
     await withdrawal.save();
 
-    await bot.telegram.sendMessage(withdrawal.userId, 
-      `✅ *Withdrawal Confirmed*\n\nYour withdrawal of ${withdrawal.amount} MMK has been confirmed and sent to your KPay account.\nKPay Name: ${withdrawal.kpayName}\nKPay Number: ${withdrawal.kpayNumber}\nNew balance: ${user.balance} MMK.`,
-      { parse_mode: 'Markdown' }
-    );
+    try {
+      await bot.telegram.sendMessage(withdrawal.userId,
+        `✅ *ငွေထုတ် အတည်ပြုပြီး*\n\n${withdrawal.amount} MMK ပေးပို့ပြီးပါပြီ!\nKPay: ${withdrawal.kpayName} (${withdrawal.kpayNumber})\nလက်ကျန်: ${user.balance} MMK`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (e) {}
 
     res.json({ success: true });
   } catch (error) {
-    console.error('Confirm withdrawal error:', error);
-    res.status(500).json({ error: 'Server error' });
+    res.status(500).json({ error: 'Server error: ' + error.message });
   }
 });
 
 app.post('/api/admin/reject-withdrawal', async (req, res) => {
   try {
     const { adminId, withdrawalId, reason } = req.body;
-    if (parseInt(adminId) !== ADMIN_ID) {
-      return res.status(403).json({ error: 'Unauthorized' });
-    }
+    if (parseInt(adminId) !== ADMIN_ID) return res.status(403).json({ error: 'Unauthorized' });
 
     const withdrawal = await Withdrawal.findById(withdrawalId);
     if (!withdrawal) return res.status(404).json({ error: 'Withdrawal not found' });
@@ -746,241 +597,310 @@ app.post('/api/admin/reject-withdrawal', async (req, res) => {
     withdrawal.status = 'rejected';
     await withdrawal.save();
 
-    await bot.telegram.sendMessage(withdrawal.userId, 
-      `❌ *Withdrawal Rejected*\n\nYour withdrawal request of ${withdrawal.amount} MMK has been rejected.\nReason: ${reason || 'Please contact admin for details.'}`,
-      { parse_mode: 'Markdown' }
-    );
+    try {
+      await bot.telegram.sendMessage(withdrawal.userId,
+        `❌ *ငွေထုတ် ငြင်းပယ်ခံရသည်*\n\n${withdrawal.amount} MMK ငြင်းပယ်ခံရပါသည်.\nအကြောင်းပြချက်: ${reason || 'Admin ကိုဆက်သွယ်ပါ'}`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (e) {}
 
     res.json({ success: true });
   } catch (error) {
-    console.error('Reject withdrawal error:', error);
     res.status(500).json({ error: 'Server error' });
   }
 });
 
 // ==================== Socket.io Game Logic ====================
+const waitingQueue = []; // { socketId, userId, gameId }
 const gameTurnTimeouts = new Map();
-const activeGames = new Map();
+const activeGames = new Map(); // gameId -> { aiTimeout }
+const socketUserMap = new Map(); // socketId -> userId
 
 io.on('connection', (socket) => {
-  console.log('👤 User connected:', socket.id);
+  console.log('👤 Connected:', socket.id);
 
-  socket.on('findGame', async () => {
+  socket.on('findGame', async (data) => {
     try {
-      const userId = socket.handshake.auth.token;
+      // FIX: Accept userId from socket auth OR from event data
+      const userId = parseInt(socket.handshake.auth?.token || data?.userId);
       if (!userId) {
-        socket.emit('error', 'Authentication required');
+        socket.emit('error', { message: 'Authentication required' });
         return;
       }
 
-      const user = await User.findOne({ telegramId: parseInt(userId) });
-      if (!user || user.balance < 1000) {
-        socket.emit('error', 'Insufficient balance to play.');
+      socketUserMap.set(socket.id, userId);
+
+      const user = await User.findOne({ telegramId: userId });
+      if (!user) {
+        socket.emit('error', { message: 'User not found' });
+        return;
+      }
+      if (user.balance < 1000) {
+        socket.emit('error', { message: 'လက်ကျန်ငွေ မလုံလောက်ပါ (1000 MMK လိုအပ်သည်)' });
         return;
       }
 
+      // Deduct entry fee
       user.balance -= 1000;
       user.totalGames += 1;
       await user.save();
 
-      const gameId = generateGameId();
-      const game = new Game({
-        gameId,
-        players: [parseInt(userId)],
-        status: 'waiting'
-      });
-      await game.save();
+      // FIX: Check waiting queue for opponent
+      const waitingPlayer = waitingQueue.find(p => p.userId !== userId);
+      
+      if (waitingPlayer) {
+        // Found opponent - start game
+        const idx = waitingQueue.indexOf(waitingPlayer);
+        waitingQueue.splice(idx, 1);
+        
+        const gameId = generateGameId();
+        const game = new Game({
+          gameId,
+          players: [waitingPlayer.userId, userId],
+          status: 'active',
+          currentTurn: waitingPlayer.userId,
+          gameStartTime: new Date(),
+          turnStartTime: new Date(),
+          isBotGame: false
+        });
+        await game.save();
 
-      socket.join(gameId);
-      socket.emit('waitingForPlayer', { gameId });
-      activeGames.set(gameId, { game, timeout: null });
+        // Clear waiting timeout for first player
+        if (activeGames.has(waitingPlayer.gameId)) {
+          const wd = activeGames.get(waitingPlayer.gameId);
+          if (wd.aiTimeout) clearTimeout(wd.aiTimeout);
+          activeGames.delete(waitingPlayer.gameId);
+        }
 
-      // Start 30-second timer for AI
-      const aiTimeout = setTimeout(async () => {
-        try {
-          const gameStillWaiting = await Game.findOne({ gameId, status: 'waiting' });
-          if (!gameStillWaiting) return;
+        // Join both to room
+        const waitingSocket = io.sockets.sockets.get(waitingPlayer.socketId);
+        if (waitingSocket) waitingSocket.join(gameId);
+        socket.join(gameId);
 
-          if (gameStillWaiting.players.length === 1) {
-            gameStillWaiting.players.push(0); // Bot
-            gameStillWaiting.status = 'active';
-            gameStillWaiting.currentTurn = gameStillWaiting.players[0];
-            gameStillWaiting.gameStartTime = new Date();
-            gameStillWaiting.turnStartTime = new Date();
-            gameStillWaiting.isBotGame = true;
-            await gameStillWaiting.save();
+        activeGames.set(gameId, {});
 
-            io.to(gameId).emit('gameStarted', { 
-              gameId, 
-              players: gameStillWaiting.players, 
-              currentTurn: gameStillWaiting.currentTurn,
+        io.to(gameId).emit('gameStarted', {
+          gameId,
+          players: game.players,
+          currentTurn: game.currentTurn,
+          isBot: false,
+          board: game.board,
+          turnStartTime: game.turnStartTime
+        });
+
+        startTurnTimer(gameId);
+
+      } else {
+        // Add to waiting queue
+        const gameId = generateGameId();
+        waitingQueue.push({ socketId: socket.id, userId, gameId });
+        socket.join(gameId);
+        socket.emit('waitingForPlayer', { gameId });
+
+        // 30s timeout -> AI game
+        const aiTimeout = setTimeout(async () => {
+          try {
+            const qIdx = waitingQueue.findIndex(p => p.userId === userId);
+            if (qIdx === -1) return; // Already matched
+            waitingQueue.splice(qIdx, 1);
+
+            const game = new Game({
+              gameId,
+              players: [userId, 0],
+              status: 'active',
+              currentTurn: userId,
+              gameStartTime: new Date(),
+              turnStartTime: new Date(),
+              isBotGame: true
+            });
+            await game.save();
+
+            activeGames.set(gameId, {});
+
+            io.to(gameId).emit('gameStarted', {
+              gameId,
+              players: game.players,
+              currentTurn: game.currentTurn,
               isBot: true,
-              turnStartTime: gameStillWaiting.turnStartTime
+              board: game.board,
+              turnStartTime: game.turnStartTime
             });
 
             startTurnTimer(gameId);
+          } catch (e) {
+            console.error('AI timeout error:', e);
           }
-        } catch (error) {
-          console.error('AI timeout error:', error);
-        }
-      }, 30000);
+        }, 30000);
 
-      if (activeGames.has(gameId)) {
-        activeGames.get(gameId).timeout = aiTimeout;
+        activeGames.set(gameId, { aiTimeout });
       }
     } catch (error) {
-      console.error('Find game error:', error);
-      socket.emit('error', 'Game creation failed');
+      console.error('findGame error:', error);
+      socket.emit('error', { message: 'ဂိမ်းစတင်မှု မအောင်မြင်ပါ: ' + error.message });
     }
   });
 
   socket.on('makeMove', async ({ gameId, row, col }) => {
     try {
+      const userId = socketUserMap.get(socket.id);
+      if (!userId) return socket.emit('error', { message: 'Not authenticated' });
+
       const game = await Game.findOne({ gameId });
       if (!game || game.status !== 'active') {
-        return socket.emit('error', 'Game not active');
+        return socket.emit('error', { message: 'Game not active' });
       }
-
-      const userId = socket.handshake.auth.token;
-      if (game.currentTurn !== parseInt(userId)) {
-        return socket.emit('error', 'Not your turn');
+      if (game.currentTurn !== userId) {
+        return socket.emit('error', { message: 'သင့်လှည့် မဟုတ်ပါ' });
       }
-
       if (game.board[row][col] !== '') {
-        return socket.emit('error', 'Invalid move');
+        return socket.emit('error', { message: 'ထိုနေရာတွင် ကစားပြီးပါပြီ' });
       }
 
-      // Check turn timer
+      // Check time
       const now = new Date();
-      const timeSinceTurnStart = (now - game.turnStartTime) / 1000;
-      if (timeSinceTurnStart > 5) {
-        const loser = game.currentTurn;
-        const winner = game.players.find(p => p !== loser) || 0;
+      const elapsed = (now - game.turnStartTime) / 1000;
+      if (elapsed > 6) {
+        // Timeout - auto lose
+        const winner = game.players.find(p => p !== userId) ?? 0;
         game.winner = winner;
         game.status = 'completed';
+        game.markModified('board');
         await game.save();
-        
         clearTurnTimer(gameId);
-        
-        io.to(gameId).emit('gameOver', { 
-          winner, 
-          board: game.board,
-          reason: 'timeout'
-        });
-        
+        io.to(gameId).emit('gameOver', { winner, board: game.board, reason: 'timeout' });
         await handleGameEnd(game);
         return;
       }
 
-      const symbol = parseInt(userId) === game.players[0] ? 'X' : 'O';
+      const symbol = userId === game.players[0] ? 'X' : 'O';
       game.board[row][col] = symbol;
-      game.lastMoveTime = now;
+      game.markModified('board'); // FIX: needed for mongoose to detect nested array change
       game.turnStartTime = now;
 
       if (ai.checkWin(game.board, symbol)) {
-        game.winner = parseInt(userId);
+        game.winner = userId;
         game.status = 'completed';
         await game.save();
-        
         clearTurnTimer(gameId);
-        
-        io.to(gameId).emit('gameOver', { 
-          winner: parseInt(userId), 
-          board: game.board,
-          reason: 'win'
-        });
-        
+        io.to(gameId).emit('gameOver', { winner: userId, board: game.board, reason: 'win' });
         await handleGameEnd(game);
         return;
       }
 
-      const isFull = game.board.every(row => row.every(cell => cell !== ''));
+      const isFull = game.board.every(r => r.every(c => c !== ''));
       if (isFull) {
         game.winner = -1;
         game.status = 'completed';
         await game.save();
-        
         clearTurnTimer(gameId);
-        
-        io.to(gameId).emit('gameOver', { 
-          winner: -1, 
-          board: game.board,
-          reason: 'draw'
-        });
-        
+        io.to(gameId).emit('gameOver', { winner: -1, board: game.board, reason: 'draw' });
         await handleGameEnd(game);
         return;
       }
 
-      game.currentTurn = game.players.find(p => p !== parseInt(userId));
+      game.currentTurn = game.players.find(p => p !== userId);
       game.turnStartTime = new Date();
       await game.save();
 
-      io.to(gameId).emit('moveMade', { 
-        board: game.board, 
+      io.to(gameId).emit('moveMade', {
+        board: game.board,
         currentTurn: game.currentTurn,
         turnStartTime: game.turnStartTime
       });
 
       resetTurnTimer(gameId);
 
+      // Bot move
       if (game.currentTurn === 0) {
         setTimeout(async () => {
           try {
-            const currentGame = await Game.findOne({ gameId });
-            if (currentGame && currentGame.status === 'active' && currentGame.currentTurn === 0) {
-              const botSymbol = currentGame.players[1] === 0 ? 'O' : 'X';
-              const bestMove = ai.getBestMove(currentGame.board, botSymbol);
-              
-              if (bestMove) {
-                const [botRow, botCol] = bestMove;
-                
-                currentGame.board[botRow][botCol] = botSymbol;
-                currentGame.lastMoveTime = new Date();
-                currentGame.turnStartTime = new Date();
+            const g = await Game.findOne({ gameId });
+            if (!g || g.status !== 'active' || g.currentTurn !== 0) return;
 
-                if (ai.checkWin(currentGame.board, botSymbol)) {
-                  currentGame.winner = 0;
-                  currentGame.status = 'completed';
-                  await currentGame.save();
-                  
-                  clearTurnTimer(gameId);
-                  
-                  io.to(gameId).emit('gameOver', { 
-                    winner: 0, 
-                    board: currentGame.board,
-                    reason: 'bot_win'
-                  });
-                  
-                  await handleGameEnd(currentGame);
-                  return;
-                }
+            const botSymbol = g.players[1] === 0 ? 'O' : 'X';
+            const move = ai.getBestMove(g.board.map(r => [...r]), botSymbol);
+            if (!move) return;
 
-                currentGame.currentTurn = currentGame.players[0];
-                await currentGame.save();
+            const [br, bc] = move;
+            g.board[br][bc] = botSymbol;
+            g.markModified('board');
+            g.turnStartTime = new Date();
 
-                io.to(gameId).emit('moveMade', { 
-                  board: currentGame.board, 
-                  currentTurn: currentGame.currentTurn,
-                  turnStartTime: currentGame.turnStartTime
-                });
-
-                resetTurnTimer(gameId);
-              }
+            if (ai.checkWin(g.board, botSymbol)) {
+              g.winner = 0;
+              g.status = 'completed';
+              await g.save();
+              clearTurnTimer(gameId);
+              io.to(gameId).emit('gameOver', { winner: 0, board: g.board, reason: 'bot_win' });
+              await handleGameEnd(g);
+              return;
             }
-          } catch (error) {
-            console.error('Bot move error:', error);
+
+            const full = g.board.every(r => r.every(c => c !== ''));
+            if (full) {
+              g.winner = -1;
+              g.status = 'completed';
+              await g.save();
+              clearTurnTimer(gameId);
+              io.to(gameId).emit('gameOver', { winner: -1, board: g.board, reason: 'draw' });
+              await handleGameEnd(g);
+              return;
+            }
+
+            g.currentTurn = g.players[0];
+            await g.save();
+            io.to(gameId).emit('moveMade', { board: g.board, currentTurn: g.currentTurn, turnStartTime: g.turnStartTime });
+            resetTurnTimer(gameId);
+          } catch (e) {
+            console.error('Bot move error:', e);
           }
-        }, 2000);
+        }, 1500);
       }
     } catch (error) {
-      console.error('Make move error:', error);
-      socket.emit('error', 'Move failed');
+      console.error('makeMove error:', error);
+      socket.emit('error', { message: 'Move failed: ' + error.message });
+    }
+  });
+
+  socket.on('cancelSearch', () => {
+    const userId = socketUserMap.get(socket.id);
+    if (!userId) return;
+    const idx = waitingQueue.findIndex(p => p.userId === userId);
+    if (idx !== -1) {
+      const item = waitingQueue.splice(idx, 1)[0];
+      if (activeGames.has(item.gameId)) {
+        const d = activeGames.get(item.gameId);
+        if (d.aiTimeout) clearTimeout(d.aiTimeout);
+        activeGames.delete(item.gameId);
+      }
+      // Refund
+      User.findOne({ telegramId: userId }).then(u => {
+        if (u) { u.balance += 1000; u.totalGames -= 1; u.save(); }
+      }).catch(() => {});
+      socket.emit('searchCancelled');
     }
   });
 
   socket.on('disconnect', () => {
-    console.log('👋 User disconnected:', socket.id);
+    const userId = socketUserMap.get(socket.id);
+    socketUserMap.delete(socket.id);
+    // Remove from waiting queue
+    const idx = waitingQueue.findIndex(p => p.socketId === socket.id);
+    if (idx !== -1) {
+      const item = waitingQueue.splice(idx, 1)[0];
+      if (activeGames.has(item.gameId)) {
+        const d = activeGames.get(item.gameId);
+        if (d.aiTimeout) clearTimeout(d.aiTimeout);
+        activeGames.delete(item.gameId);
+      }
+      // Refund on disconnect while waiting
+      if (userId) {
+        User.findOne({ telegramId: userId }).then(u => {
+          if (u) { u.balance += 1000; u.totalGames -= 1; u.save(); }
+        }).catch(() => {});
+      }
+    }
+    console.log('👋 Disconnected:', socket.id);
   });
 });
 
@@ -988,129 +908,87 @@ function startTurnTimer(gameId) {
   const timeout = setTimeout(async () => {
     try {
       const game = await Game.findOne({ gameId });
-      if (game && game.status === 'active') {
-        const now = new Date();
-        const timeSinceTurnStart = (now - game.turnStartTime) / 1000;
-        
-        if (timeSinceTurnStart > 5) {
-          const loser = game.currentTurn;
-          const winner = game.players.find(p => p !== loser) || 0;
-          game.winner = winner;
-          game.status = 'completed';
-          await game.save();
-          
-          io.to(gameId).emit('gameOver', { 
-            winner, 
-            board: game.board,
-            reason: 'timeout'
-          });
-          
-          await handleGameEnd(game);
-        } else {
-          startTurnTimer(gameId);
-        }
+      if (!game || game.status !== 'active') return;
+
+      const elapsed = (Date.now() - game.turnStartTime) / 1000;
+      if (elapsed >= 5) {
+        const loser = game.currentTurn;
+        const winner = game.players.find(p => p !== loser) ?? 0;
+        game.winner = winner;
+        game.status = 'completed';
+        await game.save();
+        clearTurnTimer(gameId);
+        io.to(gameId).emit('gameOver', { winner, board: game.board, reason: 'timeout' });
+        await handleGameEnd(game);
+      } else {
+        startTurnTimer(gameId);
       }
-    } catch (error) {
-      console.error('Turn timer error:', error);
+    } catch (e) {
+      console.error('Turn timer error:', e);
     }
   }, 1000);
-  
   gameTurnTimeouts.set(gameId, timeout);
 }
 
 function resetTurnTimer(gameId) {
-  const timeout = gameTurnTimeouts.get(gameId);
-  if (timeout) {
-    clearTimeout(timeout);
-    gameTurnTimeouts.delete(gameId);
-  }
+  clearTurnTimer(gameId);
   startTurnTimer(gameId);
 }
 
 function clearTurnTimer(gameId) {
-  const timeout = gameTurnTimeouts.get(gameId);
-  if (timeout) {
-    clearTimeout(timeout);
-    gameTurnTimeouts.delete(gameId);
-  }
+  const t = gameTurnTimeouts.get(gameId);
+  if (t) { clearTimeout(t); gameTurnTimeouts.delete(gameId); }
 }
 
 async function handleGameEnd(game) {
   try {
     if (game.winner && game.winner !== -1 && game.winner !== 0) {
+      // Human winner
       const winner = await User.findOne({ telegramId: game.winner });
       if (winner) {
         winner.balance += 1600;
         winner.wins += 1;
         await winner.save();
-        
-        await bot.telegram.sendMessage(game.winner, 
-          `🎉 *You Won!*\n\nYou received 1600 MMK.\nNew balance: ${winner.balance} MMK.`,
-          { parse_mode: 'Markdown' }
-        );
+        try {
+          await bot.telegram.sendMessage(game.winner,
+            `🏆 *အနိုင်ရပြီ!*\n\n1600 MMK ရပါပြီ!\nလက်ကျန်: ${winner.balance} MMK`,
+            { parse_mode: 'Markdown' }
+          );
+        } catch (e) {}
       }
-      
       const loserId = game.players.find(p => p !== game.winner && p !== 0);
       if (loserId) {
         const loser = await User.findOne({ telegramId: loserId });
-        if (loser) {
-          loser.losses += 1;
-          await loser.save();
-        }
+        if (loser) { loser.losses += 1; await loser.save(); }
       }
     } else if (game.winner === -1) {
-      for (let playerId of game.players) {
-        if (playerId !== 0) {
-          const user = await User.findOne({ telegramId: playerId });
-          if (user) {
-            user.balance += 500;
-            await user.save();
-          }
-        }
+      // Draw
+      for (const pid of game.players) {
+        if (pid === 0) continue;
+        const u = await User.findOne({ telegramId: pid });
+        if (u) { u.balance += 500; await u.save(); }
       }
     }
+    // Bot wins - player already lost 1000
 
     if (activeGames.has(game.gameId)) {
-      const gameData = activeGames.get(game.gameId);
-      if (gameData.timeout) {
-        clearTimeout(gameData.timeout);
-      }
       activeGames.delete(game.gameId);
     }
-  } catch (error) {
-    console.error('Handle game end error:', error);
+  } catch (e) {
+    console.error('handleGameEnd error:', e);
   }
 }
 
-// ==================== Start Server ====================
+// ==================== Start ====================
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ Server running on port ${PORT}`);
-  console.log(`🌐 Frontend URL: https://tictokfrontend.vercel.app`);
-  console.log(`🤖 Bot URL: https://t.me/tictoe1_bot`);
-  console.log(`🔍 Health check: https://tiktocbackend.onrender.com/health`);
 });
 
-// Graceful shutdown
 process.on('SIGTERM', async () => {
-  console.log('SIGTERM received. Closing connections...');
-  
-  for (const timeout of gameTurnTimeouts.values()) {
-    clearTimeout(timeout);
-  }
-  
-  for (const gameData of activeGames.values()) {
-    if (gameData.timeout) {
-      clearTimeout(gameData.timeout);
-    }
-  }
-  
-  if (mongoose.connection.readyState !== 0) {
-    await mongoose.disconnect();
-  }
-  
-  server.close(() => {
-    console.log('Server closed');
-    process.exit(0);
-  });
+  for (const t of gameTurnTimeouts.values()) clearTimeout(t);
+  for (const d of activeGames.values()) if (d.aiTimeout) clearTimeout(d.aiTimeout);
+  if (bot) bot.stop('SIGTERM');
+  await mongoose.disconnect();
+  server.close(() => process.exit(0));
 });
