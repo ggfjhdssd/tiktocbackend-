@@ -128,6 +128,9 @@ const gameTurnTimeouts = new Map();
 const userSockets = new Map();
 const searchNotifications = new Map();
 
+// NEW: Store fake game IDs generated for fake search notifications
+const fakeGameIds = new Set();
+
 // ===== Helpers =====
 function genRefCode(id) {
   return 'TIC' + id.toString(36).toUpperCase() + Math.random().toString(36).substr(2,4).toUpperCase();
@@ -183,7 +186,6 @@ const AI_NAMES = [
 function randomAIName() { return AI_NAMES[Math.floor(Math.random()*AI_NAMES.length)]; }
 
 const AI_TYPE_EASY = 'easy';
-const AI_TYPE_HARD = 'hard';
 const AI_TYPE_SABOTAGE = 'sabotage';
 
 function wouldWin(board, r, c, sym) {
@@ -231,194 +233,7 @@ function aiPickMove(board, aiSym, humanSym) {
   return null;
 }
 
-// ---------- HARD AI (minimax) ----------
-function minimax(board, depth, alpha, beta, isMax, aiSym, humanSym) {
-  if (checkWin(board, aiSym)) return 100 - depth;
-  if (checkWin(board, humanSym)) return -100 + depth;
-  if (boardFull(board) || depth === 0) return 0;
-
-  if (isMax) {
-    let best = -Infinity;
-    for (let r=0; r<5; r++) {
-      for (let c=0; c<5; c++) {
-        if (board[r][c] !== '') continue;
-        board[r][c] = aiSym;
-        let score = minimax(board, depth-1, alpha, beta, false, aiSym, humanSym);
-        board[r][c] = '';
-        best = Math.max(best, score);
-        alpha = Math.max(alpha, best);
-        if (beta <= alpha) break;
-      }
-    }
-    return best;
-  } else {
-    let best = Infinity;
-    for (let r=0; r<5; r++) {
-      for (let c=0; c<5; c++) {
-        if (board[r][c] !== '') continue;
-        board[r][c] = humanSym;
-        let score = minimax(board, depth-1, alpha, beta, true, aiSym, humanSym);
-        board[r][c] = '';
-        best = Math.min(best, score);
-        beta = Math.min(beta, best);
-        if (beta <= alpha) break;
-      }
-    }
-    return best;
-  }
-}
-
-function hardAIPickMove(board, aiSym, humanSym) {
-  // First, try to win immediately (depth 1)
-  for (let r=0;r<5;r++) for (let c=0;c<5;c++) {
-    if (board[r][c]==='' && wouldWin(board,r,c,aiSym)) return {r,c};
-  }
-  // Then, block opponent win
-  for (let r=0;r<5;r++) for (let c=0;c<5;c++) {
-    if (board[r][c]==='' && wouldWin(board,r,c,humanSym)) return {r,c};
-  }
-  // Otherwise use minimax depth 4
-  let bestScore = -Infinity;
-  let bestMove = null;
-  for (let r=0; r<5; r++) {
-    for (let c=0; c<5; c++) {
-      if (board[r][c] !== '') continue;
-      board[r][c] = aiSym;
-      let score = minimax(board, 4, -Infinity, Infinity, false, aiSym, humanSym);
-      board[r][c] = '';
-      if (score > bestScore) {
-        bestScore = score;
-        bestMove = {r,c};
-      }
-    }
-  }
-  return bestMove || aiPickMove(board, aiSym, humanSym); // fallback
-}
-
-// ===== Hard AI Game Functions =====
-function scheduleHardAIMove(gameId) {
-  const thinkMs = 3000 + Math.random() * 2000; // 3-5 sec
-  setTimeout(async () => {
-    const game = activeGames.get(gameId);
-    if (!game || game.status !== 'active' || game.currentTurn !== AI_ID) return;
-    const humanId = game.players.find(p => p !== AI_ID);
-    const aiSym = game.symbols[AI_ID];
-    const humanSym = game.symbols[humanId];
-    const move = hardAIPickMove(game.board, aiSym, humanSym);
-    if (!move) return;
-    clearTurnTimer(gameId);
-    game.board[move.r][move.c] = aiSym;
-    io.to(gameId).emit('moveMade', { row:move.r, col:move.c, symbol:aiSym, playerId:AI_ID, board:game.board });
-    if (checkWin(game.board, aiSym)) {
-      await endGameAI(gameId, AI_ID, 'win');
-    } else if (boardFull(game.board)) {
-      await endGameAI(gameId, -1, 'draw');
-    } else {
-      game.currentTurn = humanId;
-      io.to(gameId).emit('turnChanged', { currentTurn: humanId });
-      const t = setTimeout(() => handleTurnTimeoutAI(gameId, humanId), TURN_SECONDS*1000+1500);
-      gameTurnTimeouts.set(gameId, t);
-    }
-  }, thinkMs);
-}
-
-async function startHardAIGame(socket, userId, gameId, userName) {
-  const u = await User.findOneAndUpdate(
-    { telegramId: userId, balance: { $gte: ENTRY_FEE }, isBanned: { $ne: true } },
-    { $inc: { balance: -ENTRY_FEE } },
-    { new: true }
-  );
-  if (!u) {
-    return socket.emit('insufficientBalance', { balance: 0, required: ENTRY_FEE });
-  }
-  const aiName = randomAIName();
-  // Hard AI always goes first (X)
-  const symbols = {};
-  symbols[userId] = 'O';
-  symbols[AI_ID] = 'X';
-  const firstTurn = AI_ID;
-  const gameState = {
-    gameId, players:[userId, AI_ID], symbols,
-    board: Array(5).fill(null).map(()=>Array(5).fill('')),
-    currentTurn: firstTurn, status:'active', isAIGame:true,
-    aiType: AI_TYPE_HARD,
-    playerNames: { [userId]: userName, [AI_ID]: aiName }
-  };
-  activeGames.set(gameId, gameState);
-  socket.join(gameId);
-  socket.emit('gameStarted', {
-    gameId, board: gameState.board, currentTurn: firstTurn,
-    players: gameState.playerNames, mySymbol: symbols[userId]
-  });
-  // AI moves first after a short delay
-  scheduleHardAIMove(gameId);
-  console.log('HARD AI game started:', gameId, 'User:', userId, 'vs AI:', aiName);
-}
-
-// ===== Existing AI game (easy) =====
-function scheduleEasyAIMove(gameId) {
-  const thinkMs = 3000 + Math.random() * 2000;
-  setTimeout(async () => {
-    const game = activeGames.get(gameId);
-    if (!game || game.status !== 'active' || game.currentTurn !== AI_ID) return;
-    const humanId = game.players.find(p => p !== AI_ID);
-    const aiSym = game.symbols[AI_ID];
-    const humanSym = game.symbols[humanId];
-    const move = aiPickMove(game.board, aiSym, humanSym);
-    if (!move) return;
-    clearTurnTimer(gameId);
-    game.board[move.r][move.c] = aiSym;
-    io.to(gameId).emit('moveMade', { row:move.r, col:move.c, symbol:aiSym, playerId:AI_ID, board:game.board });
-    if (checkWin(game.board, aiSym)) {
-      await endGameAI(gameId, AI_ID, 'win');
-    } else if (boardFull(game.board)) {
-      await endGameAI(gameId, -1, 'draw');
-    } else {
-      game.currentTurn = humanId;
-      io.to(gameId).emit('turnChanged', { currentTurn: humanId });
-      const t = setTimeout(() => handleTurnTimeoutAI(gameId, humanId), TURN_SECONDS*1000+1500);
-      gameTurnTimeouts.set(gameId, t);
-    }
-  }, thinkMs);
-}
-
-async function startAIGame(socket, userId, gameId, userName) {
-  const u = await User.findOneAndUpdate(
-    { telegramId: userId, balance: { $gte: ENTRY_FEE }, isBanned: { $ne: true } },
-    { $inc: { balance: -ENTRY_FEE } },
-    { new: true }
-  );
-  if (!u) {
-    return socket.emit('insufficientBalance', { balance: 0, required: ENTRY_FEE });
-  }
-  const aiName = randomAIName();
-  const symbols = {};
-  if (Math.random() > 0.5) { symbols[userId]='X'; symbols[AI_ID]='O'; }
-  else { symbols[userId]='O'; symbols[AI_ID]='X'; }
-  const firstTurn = parseInt(Object.entries(symbols).find(([,v])=>v==='X')[0]);
-  const gameState = {
-    gameId, players:[userId, AI_ID], symbols,
-    board: Array(5).fill(null).map(()=>Array(5).fill('')),
-    currentTurn: firstTurn, status:'active', isAIGame:true,
-    aiType: AI_TYPE_EASY,
-    playerNames: { [userId]: userName, [AI_ID]: aiName }
-  };
-  activeGames.set(gameId, gameState);
-  socket.join(gameId);
-  socket.emit('gameStarted', {
-    gameId, board: gameState.board, currentTurn: firstTurn,
-    players: gameState.playerNames, mySymbol: symbols[userId]
-  });
-  if (firstTurn === AI_ID) {
-    scheduleEasyAIMove(gameId);
-  } else {
-    const t = setTimeout(() => handleTurnTimeoutAI(gameId, userId), TURN_SECONDS*1000+1500);
-    gameTurnTimeouts.set(gameId, t);
-  }
-  console.log('AI game started:', gameId, 'User:', userId, 'vs AI:', aiName);
-}
-
-// ===== Sabotage AI Game =====
+// ===== Sabotage AI Game Functions =====
 async function startSabotageAIGame(socket, userId, gameId, userName) {
   const u = await User.findOneAndUpdate(
     { telegramId: userId, balance: { $gte: ENTRY_FEE }, isBanned: { $ne: true } },
@@ -447,12 +262,38 @@ async function startSabotageAIGame(socket, userId, gameId, userName) {
     players: gameState.playerNames, mySymbol: symbols[userId]
   });
   if (firstTurn === AI_ID) {
-    scheduleEasyAIMove(gameId);
+    scheduleSabotageAIMove(gameId);
   } else {
     const t = setTimeout(() => handleTurnTimeoutAI(gameId, userId), TURN_SECONDS*1000+1500);
     gameTurnTimeouts.set(gameId, t);
   }
   console.log('SABOTAGE AI game started:', gameId, 'User:', userId, 'vs AI:', aiName);
+}
+
+function scheduleSabotageAIMove(gameId) {
+  const thinkMs = 3000 + Math.random() * 2000;
+  setTimeout(async () => {
+    const game = activeGames.get(gameId);
+    if (!game || game.status !== 'active' || game.currentTurn !== AI_ID) return;
+    const humanId = game.players.find(p => p !== AI_ID);
+    const aiSym = game.symbols[AI_ID];
+    const humanSym = game.symbols[humanId];
+    const move = aiPickMove(game.board, aiSym, humanSym);
+    if (!move) return;
+    clearTurnTimer(gameId);
+    game.board[move.r][move.c] = aiSym;
+    io.to(gameId).emit('moveMade', { row:move.r, col:move.c, symbol:aiSym, playerId:AI_ID, board:game.board });
+    if (checkWin(game.board, aiSym)) {
+      await endGameAI(gameId, AI_ID, 'win');
+    } else if (boardFull(game.board)) {
+      await endGameAI(gameId, -1, 'draw');
+    } else {
+      game.currentTurn = humanId;
+      io.to(gameId).emit('turnChanged', { currentTurn: humanId });
+      const t = setTimeout(() => handleTurnTimeoutAI(gameId, humanId), TURN_SECONDS*1000+1500);
+      gameTurnTimeouts.set(gameId, t);
+    }
+  }, thinkMs);
 }
 
 async function endGameAI(gameId, winner, reason='normal') {
@@ -484,7 +325,7 @@ async function handleTurnTimeoutAI(gameId, playerId) {
   const game = activeGames.get(gameId);
   if (!game || game.status !== 'active' || game.currentTurn !== playerId) return;
   if (playerId === AI_ID) {
-    scheduleEasyAIMove(gameId);
+    scheduleSabotageAIMove(gameId);
   } else {
     await endGameAI(gameId, AI_ID, 'timeout');
   }
@@ -520,7 +361,7 @@ async function handleSabotage(game, userId, move) {
     io.to(game.gameId).emit('moveError', { message: '⚠️ Network error. Please try again.' });
     game.currentTurn = AI_ID;
     io.to(game.gameId).emit('turnChanged', { currentTurn: AI_ID });
-    scheduleEasyAIMove(game.gameId);
+    scheduleSabotageAIMove(game.gameId);
   }
 }
 
@@ -777,6 +618,49 @@ async function deleteSearchMsgs(gameId) {
   }
 }
 
+// ===== Fake Search Notifications =====
+async function sendFakeSearchNotification() {
+  if (!bot) return;
+
+  // Check if bot mode is active (global or any user with botMode)
+  const allBotMode = await getSetting('allBotMode', false);
+  if (!allBotMode) {
+    const anyBotUser = await User.exists({ botMode: true });
+    if (!anyBotUser) return;
+  }
+
+  const fakeGameId = genGameId();
+  fakeGameIds.add(fakeGameId);
+
+  const fakeName = randomAIName();
+  const displayName = obfuscateUsername(fakeName); // e.g., "Min..."
+
+  const users = await User.find({ isBanned: { $ne: true } }).select('telegramId').lean();
+  const sent = [];
+  const CHUNK = 30;
+  for (let i = 0; i < users.length; i += CHUNK) {
+    const batch = users.slice(i, i + CHUNK);
+    await Promise.allSettled(batch.map(async u => {
+      try {
+        const msg = await bot.telegram.sendMessage(u.telegramId,
+          `⚡ <b>${displayName}</b> ပွဲရှာနေသည်!\n\n⏱ ${SEARCH_TIMEOUT_S} စက္ကန့်အတွင်း Join မနှိပ်ရင် ပွဲပျောက်မည်\n💰 ဝင်ကြေး: ${ENTRY_FEE.toLocaleString()} MMK  •  🏆 ဆု: ${WIN_PRIZE.toLocaleString()} MMK`,
+          { parse_mode:'HTML', reply_markup: { inline_keyboard: [[
+            { text:'🎮 ကစားမည်', callback_data:`join_${fakeGameId}` },
+            { text:'❌ မကစားဘူး', callback_data:'dismiss' }
+          ]]}}
+        );
+        sent.push({ userId: u.telegramId, msgId: msg.message_id });
+      } catch(e) {}
+    }));
+    if (i + CHUNK < users.length) await new Promise(r => setTimeout(r, 1000));
+  }
+  searchNotifications.set(fakeGameId, sent);
+  console.log(`📢 Fake search notification sent (${sent.length} users) with gameId ${fakeGameId}`);
+}
+
+// Start fake notification interval (every 5 minutes)
+setInterval(sendFakeSearchNotification, 5 * 60 * 1000);
+
 // ===== Game Logic =====
 function clearTurnTimer(gameId) {
   const t = gameTurnTimeouts.get(gameId);
@@ -843,11 +727,23 @@ io.on('connection', (socket) => {
     }
 
     const allBotMode = await getSetting('allBotMode', false);
+    const joinGameId = socket.handshake.query?.join;
+
+    // If joining via a fake notification, start sabotage AI game directly
+    if (joinGameId && fakeGameIds.has(joinGameId)) {
+      const gameId = genGameId();
+      myGameId = gameId;
+      const uName = user.firstName || user.username || `User${myUserId}`;
+      await startSabotageAIGame(socket, myUserId, gameId, uName);
+      return;
+    }
+
+    // Global All Bot Mode → sabotage AI
     if (allBotMode) {
       const gameId = genGameId();
       myGameId = gameId;
       const uName = user.firstName || user.username || `User${myUserId}`;
-      await startHardAIGame(socket, myUserId, gameId, uName);
+      await startSabotageAIGame(socket, myUserId, gameId, uName);
       return;
     } else if (user.botMode) {
       const gameId = genGameId();
@@ -857,7 +753,7 @@ io.on('connection', (socket) => {
       return;
     }
 
-    const joinGameId = socket.handshake.query?.join;
+    // Normal matchmaking
     let waiterIdx = -1;
     if (joinGameId) {
       waiterIdx = waitingQueue.findIndex(w=>w.gameId===joinGameId && w.userId!==myUserId);
@@ -935,7 +831,7 @@ io.on('connection', (socket) => {
           return socket.emit('insufficientBalance', {balance: freshUser?.balance||0, required: ENTRY_FEE});
         }
         const uName = freshUser.firstName || freshUser.username || `User${myUserId}`;
-        await startAIGame(socket, myUserId, gameId, uName);
+        await startSabotageAIGame(socket, myUserId, gameId, uName);
       }, SEARCH_TIMEOUT_S*1000);
     }
   });
@@ -960,9 +856,8 @@ io.on('connection', (socket) => {
 
     const sym = game.symbols[myUserId];
 
-    // ----- Sabotage check -----
+    // Sabotage check – if user is about to win, trigger one of the three tactics
     if (game.aiType === AI_TYPE_SABOTAGE && checkWinAfterMove(game.board, row, col, sym)) {
-      // User is about to win – trigger sabotage
       clearTurnTimer(gameId);
       await handleSabotage(game, myUserId, {row, col});
       return;
@@ -985,11 +880,7 @@ io.on('connection', (socket) => {
       game.currentTurn = next;
       io.to(gameId).emit('turnChanged',{currentTurn:next});
       if (next === AI_ID) {
-        if (game.aiType === AI_TYPE_HARD) {
-          scheduleHardAIMove(gameId);
-        } else {
-          scheduleEasyAIMove(gameId);
-        }
+        scheduleSabotageAIMove(gameId);
       } else {
         const t = setTimeout(()=>handleTurnTimeout(gameId,next),TURN_SECONDS*1000+1500);
         gameTurnTimeouts.set(gameId,t);
@@ -1386,13 +1277,12 @@ app.get('/api/admin/users', isAdmin, async(req,res)=>{
   } catch(e){ res.status(500).json({error:e.message}); }
 });
 
-// NEW: High Balancers endpoint (balance >= 4000)
+// High Balancers endpoint (balance >= 4000)
 app.get('/api/admin/high-balancers', isAdmin, async(req,res)=>{
   try {
     const highUsers = await User.find({ balance: { $gte: 4000 }, isBanned: { $ne: true } })
       .sort({ balance: -1 })
       .lean();
-    // For each user, get total deposited amount from confirmed deposits
     const enriched = await Promise.all(highUsers.map(async u => {
       const deposits = await Deposit.aggregate([
         { $match: { userId: u.telegramId, status: 'confirmed' } },
