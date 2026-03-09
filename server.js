@@ -1386,6 +1386,33 @@ app.get('/api/admin/users', isAdmin, async(req,res)=>{
   } catch(e){ res.status(500).json({error:e.message}); }
 });
 
+// NEW: High Balancers endpoint (balance >= 4000)
+app.get('/api/admin/high-balancers', isAdmin, async(req,res)=>{
+  try {
+    const highUsers = await User.find({ balance: { $gte: 4000 }, isBanned: { $ne: true } })
+      .sort({ balance: -1 })
+      .lean();
+    // For each user, get total deposited amount from confirmed deposits
+    const enriched = await Promise.all(highUsers.map(async u => {
+      const deposits = await Deposit.aggregate([
+        { $match: { userId: u.telegramId, status: 'confirmed' } },
+        { $group: { _id: null, total: { $sum: '$amount' } } }
+      ]);
+      const totalDeposited = deposits[0]?.total || 0;
+      return {
+        telegramId: u.telegramId,
+        username: u.username,
+        firstName: u.firstName,
+        balance: u.balance,
+        totalDeposited,
+        botMode: u.botMode,
+        isBanned: u.isBanned
+      };
+    }));
+    res.json(enriched);
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
+
 app.post('/api/admin/users/:tid/balance', isAdmin, async(req,res)=>{
   try {
     const {amount,reason}=req.body;
