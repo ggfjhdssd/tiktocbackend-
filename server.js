@@ -432,7 +432,7 @@ async function endGameAI(gameId, winner, reason='normal') {
       winnerName: winner===-1 ? 'draw' : (game.playerNames?.[winner] || String(winner)),
       isAIGame: !!game.isAIGame
     },{upsert:true});
-  } catch(e){ console.error('endGameAI err:',e); }
+  } catch(e){ console.error('endGameAI err:', e); }
   io.to(gameId).emit('gameOver', { winner, reason, board:game.board });
   activeGames.delete(gameId);
 }
@@ -474,6 +474,19 @@ if (BOT_TOKEN) {
     try {
       const id = ctx.from.id;
       const args = ctx.payload;
+
+      // Maintenance check – await reply and handle errors
+      const maint = await getSetting('maintenance', false);
+      if (maint && id !== ADMIN_ID) {
+        try {
+          await ctx.reply('🔧 ဆာဗာ ပြင်ဆင်နေသောကြောင့် ယာယီပိတ်ထားပါသည်။');
+        } catch (e) {
+          // User blocked or other error – just ignore, we cannot notify them
+          console.error(`Failed to send maintenance message to ${id}:`, e.message);
+        }
+        return;
+      }
+
       let user = await User.findOne({ telegramId: id });
       if (!user) {
         user = new User({
@@ -488,15 +501,11 @@ if (BOT_TOKEN) {
         }
         await user.save();
       }
-      const maint = await getSetting('maintenance', false);
-      if (maint && id !== ADMIN_ID) {
-        return ctx.reply('🔧 ဆာဗာ ပြင်ဆင်နေသောကြောင့် ယာယီပိတ်ထားပါသည်။');
-      }
 
-      // Check channel membership
+      // Channel membership check
       const isMember = await isChannelMember(id);
       if (!isMember) {
-        return ctx.reply(
+        await ctx.reply(
           `👋 မင်္ဂလာပါ ${ctx.from.first_name}!\n\n🎮 ကစားရန် ဦးစွာ Channel ကို Join ဖြစ်ရပါမည်!\n\n📢 Join ပြုလုပ်ပြီးနောက် <b>/start</b> ကို ထပ်နှိပ်ပါ`,
           {
             parse_mode: 'HTML',
@@ -505,7 +514,8 @@ if (BOT_TOKEN) {
               [Markup.button.callback('✅ Join ပြီးပြီ — စစ်ဆေးပါ', 'check_join')]
             ])
           }
-        );
+        ).catch(()=>{});
+        return;
       }
 
       await ctx.reply(
@@ -514,36 +524,41 @@ if (BOT_TOKEN) {
           [Markup.button.webApp('🎮 PLAY NOW', FRONTEND_URL)],
           [Markup.button.callback('💰 Balance','bal'), Markup.button.callback('🔗 Referral','ref')]
         ])
-      );
+      ).catch(()=>{});
     } catch(e) {
       console.error('Error in /start:', e.stack || e);
+      // Attempt to send a fallback message, but ignore if it fails
       ctx.reply('⚠️ ဆာဗာ ချိတ်ဆက်မှု ပြဿနာ').catch(()=>{});
     }
   });
 
   bot.action('check_join', async (ctx) => {
     try {
-      await ctx.answerCbQuery('စစ်ဆေးနေပါသည်...');
+      await ctx.answerCbQuery('စစ်ဆေးနေပါသည်...').catch(()=>{});
       const id = ctx.from.id;
       const isMember = await isChannelMember(id);
       if (!isMember) {
-        return ctx.reply(
+        await ctx.reply(
           `❌ Channel Join မပြုလုပ်ရသေးပါ!\n\nChannel ကို Join ပြုလုပ်ပြီးမှ ထပ်စစ်ဆေးပါ 👇`,
           Markup.inlineKeyboard([
             [Markup.button.url('📢 Channel Join ရန်', CHANNEL_LINK)],
             [Markup.button.callback('✅ Join ပြီးပြီ — စစ်ဆေးပါ', 'check_join')]
           ])
-        );
+        ).catch(()=>{});
+        return;
       }
       const user = await User.findOne({ telegramId: id }).lean();
-      if (!user) return ctx.reply('⚠️ /start ကိုနှိပ်ပါ');
+      if (!user) {
+        await ctx.reply('⚠️ /start ကိုနှိပ်ပါ').catch(()=>{});
+        return;
+      }
       await ctx.reply(
         `✅ Channel Join အောင်မြင်သည်!\n\n🎮 မင်္ဂလာပါ ${ctx.from.first_name}!\n💰 လက်ကျန်: ${user.balance.toLocaleString()} MMK\n🏆 နိုင်: ${user.wins}  •  ❌ ရှုံး: ${user.losses}`,
         Markup.inlineKeyboard([
           [Markup.button.webApp('🎮 PLAY NOW', FRONTEND_URL)],
           [Markup.button.callback('💰 Balance','bal'), Markup.button.callback('🔗 Referral','ref')]
         ])
-      );
+      ).catch(()=>{});
     } catch(e) {
       console.error('check_join error:', e.stack || e);
     }
@@ -551,33 +566,34 @@ if (BOT_TOKEN) {
 
   bot.action('bal', async (ctx) => {
     try {
-      await ctx.answerCbQuery();
+      await ctx.answerCbQuery().catch(()=>{});
       const u = await User.findOne({ telegramId: ctx.from.id }).lean();
       if (!u) return;
-      ctx.reply(`💰 လက်ကျန်: ${u.balance.toLocaleString()} MMK\n🎮 ကစားမှု: ${u.totalGames}\n🏆 နိုင်: ${u.wins}  •  ❌ ရှုံး: ${u.losses}`,
-        Markup.inlineKeyboard([[Markup.button.webApp('🎮 ကစားမည်', FRONTEND_URL)]]));
+      await ctx.reply(`💰 လက်ကျန်: ${u.balance.toLocaleString()} MMK\n🎮 ကစားမှု: ${u.totalGames}\n🏆 နိုင်: ${u.wins}  •  ❌ ရှုံး: ${u.losses}`,
+        Markup.inlineKeyboard([[Markup.button.webApp('🎮 ကစားမည်', FRONTEND_URL)]])
+      ).catch(()=>{});
     } catch(e) { console.error('bal error:', e.stack || e); }
   });
 
   bot.action('ref', async (ctx) => {
     try {
-      await ctx.answerCbQuery();
+      await ctx.answerCbQuery().catch(()=>{});
       const u = await User.findOne({ telegramId: ctx.from.id }).lean();
       if (!u) return;
       const link = `https://t.me/${BOT_USERNAME}?start=${u.referralCode}`;
-      ctx.reply(
+      await ctx.reply(
         `🔗 <b>Referral Link</b>\n\nသူငယ်ချင်း တစ်ယောက် 1,000 MMK ဖြည့်တိုင်း သင် <b>100 MMK</b> ရမည်!\n\n<code>${link}</code>`,
         { parse_mode:'HTML', ...Markup.inlineKeyboard([[
           Markup.button.url('📤 Share', `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent('🎮 TicToeTic ကစားပြီးငွေရှာကြစို့!')}`)
         ]])}
-      );
+      ).catch(()=>{});
     } catch(e) { console.error('ref error:', e.stack || e); }
   });
 
   // Join action from broadcast
   bot.action(/^join_(.+)$/, async (ctx) => {
     try {
-      await ctx.answerCbQuery('ချိတ်ဆက်နေပါသည်...');
+      await ctx.answerCbQuery('ချိတ်ဆက်နေပါသည်...').catch(()=>{});
       const gameId = ctx.match[1];
       const id = ctx.from.id;
 
@@ -585,22 +601,26 @@ if (BOT_TOKEN) {
       try { await ctx.deleteMessage(); } catch(e){}
 
       const user = await User.findOne({ telegramId: id }).lean();
-      if (!user) return ctx.reply('ဦးစွာ /start နှိပ်ပါ');
+      if (!user) {
+        await ctx.reply('ဦးစွာ /start နှိပ်ပါ').catch(()=>{});
+        return;
+      }
       if (user.balance < ENTRY_FEE) {
-        return ctx.reply(
+        await ctx.reply(
           `⚠️ ငွေမလုံလောက်ပါ!\n\nပွဲဝင်ကြေး: ${ENTRY_FEE.toLocaleString()} MMK\nသင့်ကျန်: ${user.balance.toLocaleString()} MMK`,
           Markup.inlineKeyboard([[Markup.button.webApp('💰 ငွေဖြည့်ရန်', FRONTEND_URL)]])
-        );
+        ).catch(()=>{});
+        return;
       }
       await ctx.reply(
         '✅ ပွဲတွင် ဝင်ရောက်ရန် Join ကိုနှိပ်ပါ',
         Markup.inlineKeyboard([[Markup.button.webApp('🎮 JOIN NOW', `${FRONTEND_URL}/play.html?join=${gameId}`)]])
-      );
+      ).catch(()=>{});
     } catch(e) { console.error('join action err:', e.stack || e); }
   });
 
   bot.action('dismiss', async (ctx) => {
-    try { await ctx.answerCbQuery(); await ctx.deleteMessage(); } catch(e){}
+    try { await ctx.answerCbQuery().catch(()=>{}); await ctx.deleteMessage().catch(()=>{}); } catch(e){}
   });
 
   // ===== /admin command =====
@@ -608,7 +628,8 @@ if (BOT_TOKEN) {
     try {
       const id = ctx.from.id;
       if (!ADMIN_ID || id !== ADMIN_ID) {
-        return ctx.reply('🚫 Admin အကောင့်မဟုတ်ပါ။');
+        await ctx.reply('🚫 Admin အကောင့်မဟုတ်ပါ။').catch(()=>{});
+        return;
       }
       await ctx.reply(
         `🛡️ <b>Admin Panel</b>\n\nမင်္ဂလာပါ Admin!\n\nAdmin Panel သို့ဝင်ရောက်ရန် ↓`,
@@ -618,13 +639,18 @@ if (BOT_TOKEN) {
             [Markup.button.webApp('🛡️ Admin Panel ဝင်ရန်', `${FRONTEND_URL}/admin.html`)],
           ])
         }
-      );
+      ).catch(()=>{});
     } catch(e) { console.error('admin cmd err:', e.stack || e); }
   });
 
   // Global error handler for bot
   bot.catch((err, ctx) => {
-    console.error('Bot global error:', err, ctx?.update);
+    if (err.response && err.response.error_code === 403) {
+      // User blocked the bot – ignore silently
+      console.log(`User ${ctx?.from?.id || 'unknown'} blocked the bot.`);
+    } else {
+      console.error('Bot global error:', err, ctx?.update);
+    }
   });
 
   bot.launch().then(()=>console.log('✅ Bot launched')).catch(e=>console.error('Bot launch err:',e));
@@ -658,7 +684,9 @@ async function notifyUsersGameSearch(searcherId, gameId) {
             ]]}}
           );
           sent.push({ userId: u.telegramId, msgId: msg.message_id });
-        } catch(e){} // user blocked bot or not started — skip silently
+        } catch(e) {
+          // ignore blocked users
+        }
       }));
       if (i + CHUNK < users.length) await new Promise(r => setTimeout(r, 1000));
     }
