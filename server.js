@@ -67,6 +67,7 @@ const userSchema = new mongoose.Schema({
   wins: { type: Number, default: 0 },
   losses: { type: Number, default: 0 },
   isBanned: { type: Boolean, default: false },
+  botMode: { type: Boolean, default: false },      // <-- NEW: individual bot mode
   createdAt: { type: Date, default: Date.now }
 });
 userSchema.index({ telegramId: 1 });
@@ -181,13 +182,13 @@ const AI_NAMES = [
 ];
 function randomAIName() { return AI_NAMES[Math.floor(Math.random()*AI_NAMES.length)]; }
 
+// Original easy AI (unchanged)
 function wouldWin(board, r, c, sym) {
   board[r][c] = sym;
   const w = checkWin(board, sym);
   board[r][c] = '';
   return w;
 }
-
 function scoreBoard(board, sym, oppSym) {
   const dirs = [[0,1],[1,0],[1,1],[1,-1]];
   let best = null, bestScore = -1;
@@ -208,7 +209,6 @@ function scoreBoard(board, sym, oppSym) {
   }
   return best;
 }
-
 function aiPickMove(board, aiSym, humanSym) {
   // 1) Win immediately
   for (let r=0;r<5;r++) for (let c=0;c<5;c++) {
@@ -228,8 +228,132 @@ function aiPickMove(board, aiSym, humanSym) {
   return null;
 }
 
+// ---------- HARD AI (minimax) ----------
+function minimax(board, depth, alpha, beta, isMax, aiSym, humanSym) {
+  if (checkWin(board, aiSym)) return 100 - depth;
+  if (checkWin(board, humanSym)) return -100 + depth;
+  if (boardFull(board) || depth === 0) return 0;
+
+  if (isMax) {
+    let best = -Infinity;
+    for (let r=0; r<5; r++) {
+      for (let c=0; c<5; c++) {
+        if (board[r][c] !== '') continue;
+        board[r][c] = aiSym;
+        let score = minimax(board, depth-1, alpha, beta, false, aiSym, humanSym);
+        board[r][c] = '';
+        best = Math.max(best, score);
+        alpha = Math.max(alpha, best);
+        if (beta <= alpha) break;
+      }
+    }
+    return best;
+  } else {
+    let best = Infinity;
+    for (let r=0; r<5; r++) {
+      for (let c=0; c<5; c++) {
+        if (board[r][c] !== '') continue;
+        board[r][c] = humanSym;
+        let score = minimax(board, depth-1, alpha, beta, true, aiSym, humanSym);
+        board[r][c] = '';
+        best = Math.min(best, score);
+        beta = Math.min(beta, best);
+        if (beta <= alpha) break;
+      }
+    }
+    return best;
+  }
+}
+
+function hardAIPickMove(board, aiSym, humanSym) {
+  // First, try to win immediately (depth 1)
+  for (let r=0;r<5;r++) for (let c=0;c<5;c++) {
+    if (board[r][c]==='' && wouldWin(board,r,c,aiSym)) return {r,c};
+  }
+  // Then, block opponent win
+  for (let r=0;r<5;r++) for (let c=0;c<5;c++) {
+    if (board[r][c]==='' && wouldWin(board,r,c,humanSym)) return {r,c};
+  }
+  // Otherwise use minimax depth 4
+  let bestScore = -Infinity;
+  let bestMove = null;
+  for (let r=0; r<5; r++) {
+    for (let c=0; c<5; c++) {
+      if (board[r][c] !== '') continue;
+      board[r][c] = aiSym;
+      let score = minimax(board, 4, -Infinity, Infinity, false, aiSym, humanSym);
+      board[r][c] = '';
+      if (score > bestScore) {
+        bestScore = score;
+        bestMove = {r,c};
+      }
+    }
+  }
+  return bestMove || aiPickMove(board, aiSym, humanSym); // fallback
+}
+
+// ===== Hard AI Game Functions =====
+function scheduleHardAIMove(gameId) {
+  const thinkMs = 3000 + Math.random() * 2000; // 3-5 sec
+  setTimeout(async () => {
+    const game = activeGames.get(gameId);
+    if (!game || game.status !== 'active' || game.currentTurn !== AI_ID) return;
+    const humanId = game.players.find(p => p !== AI_ID);
+    const aiSym = game.symbols[AI_ID];
+    const humanSym = game.symbols[humanId];
+    const move = hardAIPickMove(game.board, aiSym, humanSym);
+    if (!move) return;
+    clearTurnTimer(gameId);
+    game.board[move.r][move.c] = aiSym;
+    io.to(gameId).emit('moveMade', { row:move.r, col:move.c, symbol:aiSym, playerId:AI_ID, board:game.board });
+    if (checkWin(game.board, aiSym)) {
+      await endGameAI(gameId, AI_ID, 'win');
+    } else if (boardFull(game.board)) {
+      await endGameAI(gameId, -1, 'draw');
+    } else {
+      game.currentTurn = humanId;
+      io.to(gameId).emit('turnChanged', { currentTurn: humanId });
+      const t = setTimeout(() => handleTurnTimeoutAI(gameId, humanId), TURN_SECONDS*1000+1500);
+      gameTurnTimeouts.set(gameId, t);
+    }
+  }, thinkMs);
+}
+
+async function startHardAIGame(socket, userId, gameId, userName) {
+  const u = await User.findOneAndUpdate(
+    { telegramId: userId, balance: { $gte: ENTRY_FEE }, isBanned: { $ne: true } },
+    { $inc: { balance: -ENTRY_FEE } },
+    { new: true }
+  );
+  if (!u) {
+    return socket.emit('insufficientBalance', { balance: 0, required: ENTRY_FEE });
+  }
+  const aiName = randomAIName();
+  // Hard AI always goes first (X)
+  const symbols = {};
+  symbols[userId] = 'O';
+  symbols[AI_ID] = 'X';
+  const firstTurn = AI_ID;
+  const gameState = {
+    gameId, players:[userId, AI_ID], symbols,
+    board: Array(5).fill(null).map(()=>Array(5).fill('')),
+    currentTurn: firstTurn, status:'active', isAIGame:true,
+    playerNames: { [userId]: userName, [AI_ID]: aiName }
+  };
+  activeGames.set(gameId, gameState);
+  socket.join(gameId);
+  socket.emit('gameStarted', {
+    gameId, board: gameState.board, currentTurn: firstTurn,
+    players: gameState.playerNames, mySymbol: symbols[userId]
+  });
+  // AI moves first after a short delay
+  scheduleHardAIMove(gameId);
+  console.log('HARD AI game started:', gameId, 'User:', userId, 'vs AI:', aiName);
+}
+
+// ===== Existing AI game (easy) =====
 function scheduleAIMove(gameId) {
-  const thinkMs = 3000 + Math.random() * 2000; // 3-5 seconds human-like thinking
+  const thinkMs = 3000 + Math.random() * 2000;
   setTimeout(async () => {
     const game = activeGames.get(gameId);
     if (!game || game.status !== 'active' || game.currentTurn !== AI_ID) return;
@@ -254,6 +378,41 @@ function scheduleAIMove(gameId) {
   }, thinkMs);
 }
 
+async function startAIGame(socket, userId, gameId, userName) {
+  const u = await User.findOneAndUpdate(
+    { telegramId: userId, balance: { $gte: ENTRY_FEE }, isBanned: { $ne: true } },
+    { $inc: { balance: -ENTRY_FEE } },
+    { new: true }
+  );
+  if (!u) {
+    return socket.emit('insufficientBalance', { balance: 0, required: ENTRY_FEE });
+  }
+  const aiName = randomAIName();
+  const symbols = {};
+  if (Math.random() > 0.5) { symbols[userId]='X'; symbols[AI_ID]='O'; }
+  else { symbols[userId]='O'; symbols[AI_ID]='X'; }
+  const firstTurn = parseInt(Object.entries(symbols).find(([,v])=>v==='X')[0]);
+  const gameState = {
+    gameId, players:[userId, AI_ID], symbols,
+    board: Array(5).fill(null).map(()=>Array(5).fill('')),
+    currentTurn: firstTurn, status:'active', isAIGame:true,
+    playerNames: { [userId]: userName, [AI_ID]: aiName }
+  };
+  activeGames.set(gameId, gameState);
+  socket.join(gameId);
+  socket.emit('gameStarted', {
+    gameId, board: gameState.board, currentTurn: firstTurn,
+    players: gameState.playerNames, mySymbol: symbols[userId]
+  });
+  if (firstTurn === AI_ID) {
+    scheduleAIMove(gameId);
+  } else {
+    const t = setTimeout(() => handleTurnTimeoutAI(gameId, userId), TURN_SECONDS*1000+1500);
+    gameTurnTimeouts.set(gameId, t);
+  }
+  console.log('AI game started:', gameId, 'User:', userId, 'vs AI:', aiName);
+}
+
 async function endGameAI(gameId, winner, reason='normal') {
   const game = activeGames.get(gameId);
   if (!game || game.status !== 'active') return;
@@ -266,7 +425,6 @@ async function endGameAI(gameId, winner, reason='normal') {
     } else if (winner === humanId) {
       await User.findOneAndUpdate({telegramId:humanId},{$inc:{balance:WIN_PRIZE,wins:1,totalGames:1}});
     } else {
-      // AI_ID wins = human loses
       if (humanId) await User.findOneAndUpdate({telegramId:humanId},{$inc:{losses:1,totalGames:1}});
     }
     await Game.findOneAndUpdate({gameId},{
@@ -290,43 +448,7 @@ async function handleTurnTimeoutAI(gameId, playerId) {
   }
 }
 
-async function startAIGame(socket, userId, gameId, userName) {
-  const u = await User.findOneAndUpdate(
-    { telegramId: userId, balance: { $gte: ENTRY_FEE }, isBanned: { $ne: true } },
-    { $inc: { balance: -ENTRY_FEE } },
-    { new: true }
-  );
-  if (!u) {
-    return socket.emit('insufficientBalance', { balance: 0, required: ENTRY_FEE });
-  }
-  const aiName = randomAIName();
-  const symbols = {};
-  if (Math.random() > 0.5) { symbols[userId]='X'; symbols[AI_ID]='O'; }
-  else { symbols[userId]='O'; symbols[AI_ID]='X'; }
-  const firstTurn = parseInt(Object.entries(symbols).find(([,v])=>v==='X')[0]);
-  const humanSym = symbols[userId];
-  const aiSym = symbols[AI_ID];
-  const gameState = {
-    gameId, players:[userId, AI_ID], symbols,
-    board: Array(5).fill(null).map(()=>Array(5).fill('')),
-    currentTurn: firstTurn, status:'active', isAIGame:true,
-    playerNames: { [userId]: userName, [AI_ID]: aiName }
-  };
-  activeGames.set(gameId, gameState);
-  socket.join(gameId);
-  socket.emit('gameStarted', {
-    gameId, board: gameState.board, currentTurn: firstTurn,
-    players: gameState.playerNames, mySymbol: humanSym
-  });
-  if (firstTurn === AI_ID) {
-    scheduleAIMove(gameId);
-  } else {
-    const t = setTimeout(() => handleTurnTimeoutAI(gameId, userId), TURN_SECONDS*1000+1500);
-    gameTurnTimeouts.set(gameId, t);
-  }
-  console.log('AI game started:', gameId, 'User:', userId, 'vs AI:', aiName);
-}
-
+// ===== Settings Helpers =====
 async function getSetting(key, def) {
   try { const s=await Settings.findOne({key}).lean(); return s?s.value:def; } catch { return def; }
 }
@@ -615,6 +737,17 @@ io.on('connection', (socket) => {
       return socket.emit('insufficientBalance',{balance:user.balance,required:ENTRY_FEE});
     }
 
+    // ----- Check global all bot mode -----
+    const allBotMode = await getSetting('allBotMode', false);
+    if (allBotMode || user.botMode) {
+      // Force hard AI game
+      const gameId = genGameId();
+      myGameId = gameId;
+      const uName = user.firstName || user.username || `User${myUserId}`;
+      await startHardAIGame(socket, myUserId, gameId, uName);
+      return;
+    }
+
     // Check if joining via game id (from bot notification)
     const joinGameId = socket.handshake.query?.join;
     let waiterIdx = -1;
@@ -740,8 +873,12 @@ io.on('connection', (socket) => {
       game.currentTurn = next;
       io.to(gameId).emit('turnChanged',{currentTurn:next});
       if (next === AI_ID) {
-        // AI game — schedule AI move (no turn timer needed for AI side)
-        scheduleAIMove(gameId);
+        // AI game — schedule AI move (use hard AI if game was started as hard)
+        if (game.isHardAIGame) {
+          scheduleHardAIMove(gameId);
+        } else {
+          scheduleAIMove(gameId);
+        }
       } else {
         const t = setTimeout(()=>handleTurnTimeout(gameId,next),TURN_SECONDS*1000+1500);
         gameTurnTimeouts.set(gameId,t);
@@ -760,7 +897,7 @@ io.on('connection', (socket) => {
       const game = activeGames.get(myGameId);
       if (game?.status==='active') {
         if (game.isAIGame) {
-          // AI game disconnect — give 30s reconnect window (same as real game)
+          // AI game disconnect — give 30s reconnect window
           setTimeout(async()=>{
             const g = activeGames.get(myGameId);
             if (g?.status==='active') {
@@ -858,14 +995,15 @@ app.post('/api/auth', async(req,res)=>{
       referralCode:user.referralCode,
       totalGames:user.totalGames,
       wins:user.wins,
-      losses:user.losses
+      losses:user.losses,
+      botMode:user.botMode      // include botMode in response if needed
     });
   } catch(e){ console.error(e); res.status(500).json({error:'Server error'}); }
 });
 
 app.get('/api/user/:id', async(req,res)=>{
   try {
-    const u=await User.findOne({telegramId:parseInt(req.params.id)}).select('balance totalGames wins losses').lean();
+    const u=await User.findOne({telegramId:parseInt(req.params.id)}).select('balance totalGames wins losses botMode').lean();
     if (!u) return res.status(404).json({error:'Not found'});
     res.json(u);
   } catch(e){ res.status(500).json({error:'Server error'}); }
@@ -901,14 +1039,11 @@ app.post('/api/withdraw', async(req,res)=>{
       return res.status(400).json({error:'အနည်းဆုံး 3,000 MMK'});
     const tid=parseInt(telegramId);
 
-    // FIX 1: Check banned/balance separately for precise error message
     const chk=await User.findOne({telegramId:tid}).select('balance isBanned firstName username').lean();
     if (!chk) return res.status(404).json({error:'User မတွေ့ပါ'});
     if (chk.isBanned===true) return res.status(403).json({error:'🚫 ကောင်ပိတ်ဆို့ထားသည်'});
     if (chk.balance<amt) return res.status(400).json({error:`လက်ကျန်ငွေ မလုံလောက်ပါ (ကျန်: ${chk.balance.toLocaleString()} MMK)`});
 
-    // FIX 2: Save Withdrawal record FIRST (pending), THEN deduct balance
-    // If deduction fails → delete record + rollback. User never loses money without a record.
     let wd;
     try {
       wd=await new Withdrawal({userId:tid,kpayName,kpayNumber,amount:amt}).save();
@@ -917,16 +1052,13 @@ app.post('/api/withdraw', async(req,res)=>{
       return res.status(500).json({error:'Record သိမ်းမရပါ၊ ထပ်ကြိုးစားပါ'});
     }
 
-    // FIX 3: Atomic balance deduction — isBanned:{$ne:true} covers null/undefined fields too
     const u=await User.findOneAndUpdate(
       {telegramId:tid, balance:{$gte:amt}, isBanned:{$ne:true}},
       {$inc:{balance:-amt}},
       {new:true}
     );
     if (!u) {
-      // Deduction failed — rollback: delete the pending record
       await Withdrawal.findByIdAndDelete(wd._id).catch(()=>{});
-      // Re-check why it failed
       const rechk=await User.findOne({telegramId:tid}).select('balance isBanned').lean();
       if (rechk?.isBanned===true) return res.status(403).json({error:'🚫 ကောင်ပိတ်ဆို့ထားသည်'});
       return res.status(400).json({error:`လက်ကျန်ငွေ မလုံလောက်ပါ (ကျန်: ${(rechk?.balance||0).toLocaleString()} MMK)`});
@@ -993,12 +1125,10 @@ app.delete('/api/admin/games/:gameId', isAdmin, async(req,res)=>{
     if (!g) return res.status(404).json({error:'Game not found'});
     // Deduct prize money from winner if game was completed
     if (g.status==='completed' && g.winner && g.winner !== -1 && g.winner !== -999999) {
-      // Win prize was added — take it back
       await User.findOneAndUpdate({telegramId:g.winner},{$inc:{balance:-WIN_PRIZE,wins:-1,totalGames:-1}});
       const loser = (g.players||[]).find(p=>p!==g.winner&&p!==-999999);
       if (loser) await User.findOneAndUpdate({telegramId:loser},{$inc:{losses:-1,totalGames:-1}});
     } else if (g.status==='completed' && g.winner===-1) {
-      // Draw — refund was given, take back draw refund
       for (const pid of (g.players||[])) {
         if (pid===-999999) continue;
         await User.findOneAndUpdate({telegramId:pid},{$inc:{balance:-DRAW_REFUND,totalGames:-1}});
@@ -1031,13 +1161,25 @@ app.get('/api/admin/stats', isAdmin, async(_,res)=>{
 });
 
 app.get('/api/admin/settings', isAdmin, async(_,res)=>{
-  const maint=await getSetting('maintenance',false);
-  res.json({maintenance:maint,entryFee:ENTRY_FEE,winPrize:WIN_PRIZE,drawRefund:DRAW_REFUND,turnSeconds:TURN_SECONDS});
+  const maint = await getSetting('maintenance',false);
+  const allBotMode = await getSetting('allBotMode', false);
+  res.json({maintenance:maint, allBotMode, entryFee:ENTRY_FEE, winPrize:WIN_PRIZE, drawRefund:DRAW_REFUND, turnSeconds:TURN_SECONDS});
 });
 
 app.post('/api/admin/maintenance', isAdmin, async(req,res)=>{
   await setSetting('maintenance',!!req.body.enabled);
   res.json({success:true,maintenance:!!req.body.enabled});
+});
+
+// ----- All Bot Mode endpoints -----
+app.get('/api/admin/allbotmode', isAdmin, async(req,res)=>{
+  const allBotMode = await getSetting('allBotMode', false);
+  res.json({allBotMode});
+});
+
+app.post('/api/admin/allbotmode', isAdmin, async(req,res)=>{
+  await setSetting('allBotMode', !!req.body.enabled);
+  res.json({success:true, allBotMode: !!req.body.enabled});
 });
 
 app.get('/api/admin/deposits', isAdmin, async(req,res)=>{
@@ -1163,12 +1305,21 @@ app.post('/api/admin/users/:tid/ban', isAdmin, async(req,res)=>{
   } catch(e){ res.status(500).json({error:e.message}); }
 });
 
+// ----- NEW: Toggle botMode for a user -----
+app.post('/api/admin/users/:tid/botmode', isAdmin, async(req,res)=>{
+  try {
+    const {enabled}=req.body;
+    const u=await User.findOneAndUpdate({telegramId:parseInt(req.params.tid)},{botMode:!!enabled},{new:true});
+    if (!u) return res.status(404).json({error:'User not found'});
+    res.json({success:true, botMode:u.botMode});
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
+
 app.post('/api/admin/broadcast', isAdmin, async(req,res)=>{
   try {
     const {message,buttonText,buttonUrl}=req.body;
     if (!message) return res.status(400).json({error:'Message required'});
     res.json({success:true,msg:'Broadcast started in background'});
-    // FIX: Run in background, chunked in batches of 30 to avoid server freeze
     setImmediate(async()=>{
       const users=await User.find({isBanned:{$ne:true}}).select('telegramId').lean();
       const kb=buttonText&&buttonUrl?{inline_keyboard:[[{text:buttonText,url:buttonUrl}]]}:undefined;
@@ -1182,7 +1333,6 @@ app.post('/api/admin/broadcast', isAdmin, async(req,res)=>{
             sent++;
           } catch(e){fail++;}
         }));
-        // Pause between chunks to avoid Telegram rate limit
         if (i+CHUNK<users.length) await new Promise(r=>setTimeout(r,1000));
       }
       console.log(`Broadcast done: ${sent} sent, ${fail} failed / ${users.length} total`);
