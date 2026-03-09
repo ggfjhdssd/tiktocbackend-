@@ -504,24 +504,38 @@ async function notifyUsersGameSearch(searcherId, gameId) {
   if (!bot) return;
   try {
     const searcher = await User.findOne({ telegramId: searcherId }).select('firstName username').lean();
-    const name = searcher?.firstName || searcher?.username || 'တစ်ယောက်';
-    const users = await User.find({ telegramId:{$ne:searcherId}, isBanned:false })
-      .select('telegramId').lean().limit(200);
+    // Show @username if available, else firstName
+    const displayName = searcher?.username
+      ? `@${searcher.username}`
+      : (searcher?.firstName || 'တစ်ယောက်');
+
+    // Notify ALL users who have started the bot (in DB), not banned, excluding searcher
+    const users = await User.find({
+      telegramId: { $ne: searcherId },
+      isBanned: { $ne: true }
+    }).select('telegramId').lean();
+
     const sent = [];
-    for (const u of users) {
-      try {
-        const msg = await bot.telegram.sendMessage(u.telegramId,
-          `⚡ <b>${name}</b> ပွဲရှာနေသည်!\n\n⏱ ${SEARCH_TIMEOUT_S} စက္ကန့်အတွင်း Join မနှိပ်ရင် ပွဲပျောက်မည်\n💰 ဝင်ကြေး: ${ENTRY_FEE.toLocaleString()} MMK  •  🏆 ဆု: ${WIN_PRIZE.toLocaleString()} MMK`,
-          { parse_mode:'HTML', reply_markup: { inline_keyboard: [[
-            { text:'🎮 Join Game', callback_data:`join_${gameId}` },
-            { text:'❌ မကစားဘူး', callback_data:'dismiss' }
-          ]]}}
-        );
-        sent.push({ userId: u.telegramId, msgId: msg.message_id });
-        await new Promise(r=>setTimeout(r,50));
-      } catch(e){}
+    const CHUNK = 30;
+    for (let i = 0; i < users.length; i += CHUNK) {
+      const batch = users.slice(i, i + CHUNK);
+      await Promise.allSettled(batch.map(async u => {
+        try {
+          const msg = await bot.telegram.sendMessage(u.telegramId,
+            `⚡ <b>${displayName}</b> ပွဲရှာနေသည်!\n\n⏱ ${SEARCH_TIMEOUT_S} စက္ကန့်အတွင်း Join မနှိပ်ရင် ပွဲပျောက်မည်\n💰 ဝင်ကြေး: ${ENTRY_FEE.toLocaleString()} MMK  •  🏆 ဆု: ${WIN_PRIZE.toLocaleString()} MMK`,
+            { parse_mode:'HTML', reply_markup: { inline_keyboard: [[
+              { text:'🎮 ကစားမည်', callback_data:`join_${gameId}` },
+              { text:'❌ မကစားဘူး', callback_data:'dismiss' }
+            ]]}}
+          );
+          sent.push({ userId: u.telegramId, msgId: msg.message_id });
+        } catch(e){} // user blocked bot or not started — skip silently
+      }));
+      // Rate limit pause between chunks
+      if (i + CHUNK < users.length) await new Promise(r => setTimeout(r, 1000));
     }
     searchNotifications.set(gameId, sent);
+    console.log(`📢 Notified ${sent.length}/${users.length} users for game ${gameId}`);
   } catch(e){ console.error('notify err:',e); }
 }
 
