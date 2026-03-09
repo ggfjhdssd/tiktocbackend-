@@ -67,7 +67,7 @@ const userSchema = new mongoose.Schema({
   wins: { type: Number, default: 0 },
   losses: { type: Number, default: 0 },
   isBanned: { type: Boolean, default: false },
-  botMode: { type: Boolean, default: false },      // <-- NEW: individual bot mode
+  botMode: { type: Boolean, default: false },
   createdAt: { type: Date, default: Date.now }
 });
 userSchema.index({ telegramId: 1 });
@@ -182,7 +182,6 @@ const AI_NAMES = [
 ];
 function randomAIName() { return AI_NAMES[Math.floor(Math.random()*AI_NAMES.length)]; }
 
-// Original easy AI (unchanged)
 function wouldWin(board, r, c, sym) {
   board[r][c] = sym;
   const w = checkWin(board, sym);
@@ -472,9 +471,9 @@ if (BOT_TOKEN) {
   }
 
   bot.start(async (ctx) => {
-    const id = ctx.from.id;
-    const args = ctx.payload;
     try {
+      const id = ctx.from.id;
+      const args = ctx.payload;
       let user = await User.findOne({ telegramId: id });
       if (!user) {
         user = new User({
@@ -516,7 +515,10 @@ if (BOT_TOKEN) {
           [Markup.button.callback('💰 Balance','bal'), Markup.button.callback('🔗 Referral','ref')]
         ])
       );
-    } catch(e) { console.error(e); ctx.reply('⚠️ ဆာဗာ ချိတ်ဆက်မှု ပြဿနာ'); }
+    } catch(e) {
+      console.error('Error in /start:', e.stack || e);
+      ctx.reply('⚠️ ဆာဗာ ချိတ်ဆက်မှု ပြဿနာ').catch(()=>{});
+    }
   });
 
   bot.action('check_join', async (ctx) => {
@@ -542,7 +544,9 @@ if (BOT_TOKEN) {
           [Markup.button.callback('💰 Balance','bal'), Markup.button.callback('🔗 Referral','ref')]
         ])
       );
-    } catch(e) { console.error('check_join err:',e); }
+    } catch(e) {
+      console.error('check_join error:', e.stack || e);
+    }
   });
 
   bot.action('bal', async (ctx) => {
@@ -552,7 +556,7 @@ if (BOT_TOKEN) {
       if (!u) return;
       ctx.reply(`💰 လက်ကျန်: ${u.balance.toLocaleString()} MMK\n🎮 ကစားမှု: ${u.totalGames}\n🏆 နိုင်: ${u.wins}  •  ❌ ရှုံး: ${u.losses}`,
         Markup.inlineKeyboard([[Markup.button.webApp('🎮 ကစားမည်', FRONTEND_URL)]]));
-    } catch(e){}
+    } catch(e) { console.error('bal error:', e.stack || e); }
   });
 
   bot.action('ref', async (ctx) => {
@@ -567,7 +571,7 @@ if (BOT_TOKEN) {
           Markup.button.url('📤 Share', `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent('🎮 TicToeTic ကစားပြီးငွေရှာကြစို့!')}`)
         ]])}
       );
-    } catch(e){}
+    } catch(e) { console.error('ref error:', e.stack || e); }
   });
 
   // Join action from broadcast
@@ -592,7 +596,7 @@ if (BOT_TOKEN) {
         '✅ ပွဲတွင် ဝင်ရောက်ရန် Join ကိုနှိပ်ပါ',
         Markup.inlineKeyboard([[Markup.button.webApp('🎮 JOIN NOW', `${FRONTEND_URL}/play.html?join=${gameId}`)]])
       );
-    } catch(e){ console.error('join action err:',e); }
+    } catch(e) { console.error('join action err:', e.stack || e); }
   });
 
   bot.action('dismiss', async (ctx) => {
@@ -615,10 +619,15 @@ if (BOT_TOKEN) {
           ])
         }
       );
-    } catch(e) { console.error('admin cmd err:', e); }
+    } catch(e) { console.error('admin cmd err:', e.stack || e); }
   });
 
-  bot.launch().then(()=>console.log('✅ Bot launched')).catch(e=>console.error('Bot err:',e));
+  // Global error handler for bot
+  bot.catch((err, ctx) => {
+    console.error('Bot global error:', err, ctx?.update);
+  });
+
+  bot.launch().then(()=>console.log('✅ Bot launched')).catch(e=>console.error('Bot launch err:',e));
 }
 
 // ===== Notify All Users =====
@@ -626,12 +635,10 @@ async function notifyUsersGameSearch(searcherId, gameId) {
   if (!bot) return;
   try {
     const searcher = await User.findOne({ telegramId: searcherId }).select('firstName username').lean();
-    // Show @username if available, else firstName
     const displayName = searcher?.username
       ? `@${searcher.username}`
       : (searcher?.firstName || 'တစ်ယောက်');
 
-    // Notify ALL users who have started the bot (in DB), not banned, excluding searcher
     const users = await User.find({
       telegramId: { $ne: searcherId },
       isBanned: { $ne: true }
@@ -653,12 +660,11 @@ async function notifyUsersGameSearch(searcherId, gameId) {
           sent.push({ userId: u.telegramId, msgId: msg.message_id });
         } catch(e){} // user blocked bot or not started — skip silently
       }));
-      // Rate limit pause between chunks
       if (i + CHUNK < users.length) await new Promise(r => setTimeout(r, 1000));
     }
     searchNotifications.set(gameId, sent);
     console.log(`📢 Notified ${sent.length}/${users.length} users for game ${gameId}`);
-  } catch(e){ console.error('notify err:',e); }
+  } catch(e){ console.error('notify err:', e.stack || e); }
 }
 
 async function deleteSearchMsgs(gameId) {
@@ -699,7 +705,7 @@ async function endGame(gameId, winner, reason='normal') {
       winnerName: winner===-1 ? 'draw' : (game.playerNames?.[winner] || String(winner)),
       isAIGame: !!game.isAIGame
     },{upsert:true});
-  } catch(e){ console.error('endGame err:',e); }
+  } catch(e){ console.error('endGame err:', e.stack || e); }
 
   io.to(gameId).emit('gameOver',{winner,reason,board:game.board});
   activeGames.delete(gameId);
@@ -716,7 +722,6 @@ io.on('connection', (socket) => {
     myUserId = parseInt(userId);
     userSockets.set(myUserId, socket.id);
 
-    // Check if reconnecting to active game
     const existEntry = [...activeGames.entries()].find(([,g])=>g.players.includes(myUserId));
     if (existEntry) {
       const [gid, game] = existEntry;
@@ -737,10 +742,8 @@ io.on('connection', (socket) => {
       return socket.emit('insufficientBalance',{balance:user.balance,required:ENTRY_FEE});
     }
 
-    // ----- Check global all bot mode -----
     const allBotMode = await getSetting('allBotMode', false);
     if (allBotMode || user.botMode) {
-      // Force hard AI game
       const gameId = genGameId();
       myGameId = gameId;
       const uName = user.firstName || user.username || `User${myUserId}`;
@@ -748,7 +751,6 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // Check if joining via game id (from bot notification)
     const joinGameId = socket.handshake.query?.join;
     let waiterIdx = -1;
     if (joinGameId) {
@@ -762,7 +764,6 @@ io.on('connection', (socket) => {
       const waiter = waitingQueue.splice(waiterIdx,1)[0];
       myGameId = waiter.gameId;
 
-      // Deduct fees atomically
       try {
         const w1 = await User.findOneAndUpdate({telegramId:waiter.userId,balance:{$gte:ENTRY_FEE}},{$inc:{balance:-ENTRY_FEE}},{new:true});
         const w2 = await User.findOneAndUpdate({telegramId:myUserId,balance:{$gte:ENTRY_FEE}},{$inc:{balance:-ENTRY_FEE}},{new:true});
@@ -810,7 +811,6 @@ io.on('connection', (socket) => {
       gameTurnTimeouts.set(myGameId,t);
 
     } else {
-      // Add to queue
       const gameId = genGameId();
       myGameId = gameId;
       socket.join(gameId);
@@ -818,20 +818,16 @@ io.on('connection', (socket) => {
       socket.emit('waitingForPlayer',{gameId,searchTimeout:SEARCH_TIMEOUT_S});
       notifyUsersGameSearch(myUserId, gameId);
 
-      // After 30s no opponent found — start AI game instead of cancelling
       setTimeout(async()=>{
         const idx=waitingQueue.findIndex(w=>w.gameId===gameId);
-        if (idx===-1) return; // already matched with real player
+        if (idx===-1) return;
         waitingQueue.splice(idx,1);
         await deleteSearchMsgs(gameId);
-        // Check socket still connected
         if (!socket.connected) return;
-        // Check user still has enough balance (re-fetch fresh)
         const freshUser = await User.findOne({telegramId:myUserId}).lean();
         if (!freshUser || freshUser.balance < ENTRY_FEE) {
           return socket.emit('insufficientBalance', {balance: freshUser?.balance||0, required: ENTRY_FEE});
         }
-        // Start AI game using same gameId
         const uName = freshUser.firstName || freshUser.username || `User${myUserId}`;
         await startAIGame(socket, myUserId, gameId, uName);
       }, SEARCH_TIMEOUT_S*1000);
@@ -873,7 +869,6 @@ io.on('connection', (socket) => {
       game.currentTurn = next;
       io.to(gameId).emit('turnChanged',{currentTurn:next});
       if (next === AI_ID) {
-        // AI game — schedule AI move (use hard AI if game was started as hard)
         if (game.isHardAIGame) {
           scheduleHardAIMove(gameId);
         } else {
@@ -897,7 +892,6 @@ io.on('connection', (socket) => {
       const game = activeGames.get(myGameId);
       if (game?.status==='active') {
         if (game.isAIGame) {
-          // AI game disconnect — give 30s reconnect window
           setTimeout(async()=>{
             const g = activeGames.get(myGameId);
             if (g?.status==='active') {
@@ -943,7 +937,7 @@ function isAdmin(req,res,next) {
   next();
 }
 
-// Admin identity verification endpoint (used by frontend before showing admin panel)
+// Admin identity verification endpoint
 app.post('/api/admin/verify', async(req,res)=>{
   try {
     const {telegramId}=req.body;
@@ -996,7 +990,7 @@ app.post('/api/auth', async(req,res)=>{
       totalGames:user.totalGames,
       wins:user.wins,
       losses:user.losses,
-      botMode:user.botMode      // include botMode in response if needed
+      botMode:user.botMode
     });
   } catch(e){ console.error(e); res.status(500).json({error:'Server error'}); }
 });
@@ -1102,7 +1096,6 @@ app.get('/api/admin/games', isAdmin, async(req,res)=>{
     }
     const games = await Game.find(q).sort({createdAt:-1}).skip(skip).limit(limit).lean();
     const total = await Game.countDocuments(q);
-    // Enrich with player names from User collection if missing
     const enriched = await Promise.all(games.map(async g => {
       const pNames = {};
       for (const pid of (g.players||[])) {
@@ -1123,7 +1116,6 @@ app.delete('/api/admin/games/:gameId', isAdmin, async(req,res)=>{
   try {
     const g = await Game.findOne({gameId:req.params.gameId}).lean();
     if (!g) return res.status(404).json({error:'Game not found'});
-    // Deduct prize money from winner if game was completed
     if (g.status==='completed' && g.winner && g.winner !== -1 && g.winner !== -999999) {
       await User.findOneAndUpdate({telegramId:g.winner},{$inc:{balance:-WIN_PRIZE,wins:-1,totalGames:-1}});
       const loser = (g.players||[]).find(p=>p!==g.winner&&p!==-999999);
@@ -1171,7 +1163,6 @@ app.post('/api/admin/maintenance', isAdmin, async(req,res)=>{
   res.json({success:true,maintenance:!!req.body.enabled});
 });
 
-// ----- All Bot Mode endpoints -----
 app.get('/api/admin/allbotmode', isAdmin, async(req,res)=>{
   const allBotMode = await getSetting('allBotMode', false);
   res.json({allBotMode});
@@ -1200,7 +1191,6 @@ app.post('/api/admin/deposits/:id/confirm', isAdmin, async(req,res)=>{
     if (dep.status!=='pending') return res.status(400).json({error:'Already processed'});
     dep.status='confirmed'; dep.processedAt=new Date(); await dep.save();
     await User.findOneAndUpdate({telegramId:dep.userId},{$inc:{balance:dep.amount}});
-    // Referral bonus check
     const user=await User.findOne({telegramId:dep.userId}).lean();
     if (user?.referredBy) {
       const prevDeps=await Deposit.countDocuments({userId:dep.userId,status:'confirmed',_id:{$ne:dep._id}});
@@ -1259,7 +1249,6 @@ app.post('/api/admin/withdrawals/:id/reject', isAdmin, async(req,res)=>{
     if (!wd) return res.status(404).json({error:'Not found'});
     if (wd.status!=='pending') return res.status(400).json({error:'Already processed'});
     wd.status='rejected'; wd.processedAt=new Date(); await wd.save();
-    // Refund
     await User.findOneAndUpdate({telegramId:wd.userId},{$inc:{balance:wd.amount}});
     if (bot) bot.telegram.sendMessage(wd.userId,
       `❌ ငွေ ${wd.amount.toLocaleString()} MMK ထုတ်မှု ပယ်ချပြီး ငွေပြန်အမ်းပြီ`).catch(()=>{});
@@ -1305,7 +1294,6 @@ app.post('/api/admin/users/:tid/ban', isAdmin, async(req,res)=>{
   } catch(e){ res.status(500).json({error:e.message}); }
 });
 
-// ----- NEW: Toggle botMode for a user -----
 app.post('/api/admin/users/:tid/botmode', isAdmin, async(req,res)=>{
   try {
     const {enabled}=req.body;
@@ -1354,7 +1342,13 @@ setInterval(()=>{
   try { https.get(`${BACKEND_URL}/health`,()=>{}).on('error',()=>{}); } catch(e){}
 }, 5*60*1000);
 
+// ===== Global unhandled rejection/exception handlers =====
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+});
+
 const PORT = process.env.PORT||3000;
 server.listen(PORT, ()=>console.log(`🚀 Server on port ${PORT}`));
-process.on('unhandledRejection',e=>console.error('UnhandledRejection:',e));
-process.on('uncaughtException',e=>console.error('UncaughtException:',e));
