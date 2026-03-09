@@ -98,11 +98,14 @@ withdrawalSchema.index({ status: 1 });
 const gameSchema = new mongoose.Schema({
   gameId: { type: String, required: true, unique: true },
   players: [Number],
+  playerNames: { type: Map, of: String, default: {} },
   symbols: { type: Map, of: String },
   board: { type: [[String]], default: () => Array(5).fill(null).map(() => Array(5).fill('')) },
   winner: { type: mongoose.Schema.Types.Mixed, default: null },
+  winnerName: { type: String, default: '' },
   status: { type: String, enum: ['waiting','active','completed'], default: 'waiting' },
-  createdAt: { type: Date, default: Date.now, expires: 86400 }
+  isAIGame: { type: Boolean, default: false },
+  createdAt: { type: Date, default: Date.now, expires: 86400*30 }
 });
 gameSchema.index({ gameId: 1 });
 
@@ -266,8 +269,12 @@ async function endGameAI(gameId, winner, reason='normal') {
       // AI_ID wins = human loses
       if (humanId) await User.findOneAndUpdate({telegramId:humanId},{$inc:{losses:1,totalGames:1}});
     }
-    await Game.findOneAndUpdate({gameId},{winner,status:'completed',board:game.board},{upsert:true});
-  } catch(e){ console.error('endGameAI err:',e); }
+    await Game.findOneAndUpdate({gameId},{
+      winner, status:'completed', board:game.board,
+      playerNames: game.playerNames,
+      winnerName: winner===-1 ? 'draw' : (game.playerNames?.[winner] || String(winner)),
+      isAIGame: !!game.isAIGame
+    },{upsert:true});
   io.to(gameId).emit('gameOver', { winner, reason, board:game.board });
   activeGames.delete(gameId);
 }
@@ -459,7 +466,7 @@ if (BOT_TOKEN) {
         );
       }
       await ctx.reply(
-        '✅ ပွဲတွင် ဝင်ရောက်ရန် PLAY ကိုနှိပ်ပါ',
+        '✅ ပွဲတွင် ဝင်ရောက်ရန် Join ကိုနှိပ်ပါ',
         Markup.inlineKeyboard([[Markup.button.webApp('🎮 JOIN NOW', `${FRONTEND_URL}/play.html?join=${gameId}`)]])
       );
     } catch(e){ console.error('join action err:',e); }
@@ -549,10 +556,13 @@ async function endGame(gameId, winner, reason='normal') {
       await User.findOneAndUpdate({telegramId:winner},{$inc:{balance:WIN_PRIZE,wins:1,totalGames:1}});
       if (loser) await User.findOneAndUpdate({telegramId:loser},{$inc:{losses:1,totalGames:1}});
     }
-    await Game.findOneAndUpdate({gameId},{winner,status:'completed',board:game.board},{upsert:true});
+    await Game.findOneAndUpdate({gameId},{
+      winner, status:'completed', board:game.board,
+      playerNames: game.playerNames,
+      winnerName: winner===-1 ? 'draw' : (game.playerNames?.[winner] || String(winner)),
+      isAIGame: !!game.isAIGame
+    },{upsert:true});
   } catch(e){ console.error('endGame err:',e); }
-
-  io.to(gameId).emit('gameOver',{winner,reason,board:game.board});
   activeGames.delete(gameId);
   setTimeout(()=>deleteSearchMsgs(gameId),500);
 }
@@ -930,6 +940,58 @@ app.get('/api/referrals/:telegramId', async(req,res)=>{
   } catch(e) { res.status(500).json({error:e.message}); }
 });
 
+// ===== Game History Admin Routes =====
+app.get('/api/admin/games', isAdmin, async(req,res)=>{
+  try {
+    const { page=1, search='' } = req.query;
+    const limit = 20;
+    const skip = (parseInt(page)-1)*limit;
+    let q = { status:'completed' };
+    if (search) {
+      const tid = isNaN(search) ? null : parseInt(search);
+      if (tid) q = { ...q, players: tid };
+    }
+    const games = await Game.find(q).sort({createdAt:-1}).skip(skip).limit(limit).lean();
+    const total = await Game.countDocuments(q);
+    // Enrich with player names from User collection if missing
+    const enriched = await Promise.all(games.map(async g => {
+      const pNames = {};
+      for (const pid of (g.players||[])) {
+        if (pid === -999999) { pNames[pid]='🤖 AI'; continue; }
+        const nm = g.playerNames ? (g.playerNames instanceof Map ? g.playerNames.get(String(pid)) : g.playerNames[pid]) : null;
+        if (nm) { pNames[pid]=nm; continue; }
+        const u = await User.findOne({telegramId:pid}).select('firstName username').lean();
+        pNames[pid] = u?.firstName||u?.username||`User${pid}`;
+      }
+      const winnerName = g.winner===-1 ? '🤝 သရေ' : g.winner ? (pNames[g.winner]||String(g.winner)) : '—';
+      return { ...g, pNames, winnerName };
+    }));
+    res.json({ games: enriched, total, pages: Math.ceil(total/limit) });
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
+
+app.delete('/api/admin/games/:gameId', isAdmin, async(req,res)=>{
+  try {
+    const g = await Game.findOne({gameId:req.params.gameId}).lean();
+    if (!g) return res.status(404).json({error:'Game not found'});
+    // Deduct prize money from winner if game was completed
+    if (g.status==='completed' && g.winner && g.winner !== -1 && g.winner !== -999999) {
+      // Win prize was added — take it back
+      await User.findOneAndUpdate({telegramId:g.winner},{$inc:{balance:-WIN_PRIZE,wins:-1,totalGames:-1}});
+      const loser = (g.players||[]).find(p=>p!==g.winner&&p!==-999999);
+      if (loser) await User.findOneAndUpdate({telegramId:loser},{$inc:{losses:-1,totalGames:-1}});
+    } else if (g.status==='completed' && g.winner===-1) {
+      // Draw — refund was given, take back draw refund
+      for (const pid of (g.players||[])) {
+        if (pid===-999999) continue;
+        await User.findOneAndUpdate({telegramId:pid},{$inc:{balance:-DRAW_REFUND,totalGames:-1}});
+      }
+    }
+    await Game.deleteOne({gameId:req.params.gameId});
+    res.json({success:true});
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
+
 // ===== Admin Routes =====
 app.get('/api/admin/stats', isAdmin, async(_,res)=>{
   try {
@@ -999,10 +1061,12 @@ app.post('/api/admin/deposits/:id/confirm', isAdmin, async(req,res)=>{
 
 app.post('/api/admin/deposits/:id/reject', isAdmin, async(req,res)=>{
   try {
+    const { reason } = req.body;
     const dep=await Deposit.findByIdAndUpdate(req.params.id,{status:'rejected',processedAt:new Date()},{new:true});
     if (!dep) return res.status(404).json({error:'Not found'});
+    const reasonText = reason ? `\nအကြောင်းပြချက်: ${reason}` : '';
     if (bot) bot.telegram.sendMessage(dep.userId,
-      `❌ ငွေ ${dep.amount.toLocaleString()} MMK သွင်းမှု ပယ်ချပြီ\nTxn: ${dep.transactionId}`).catch(()=>{});
+      `❌ ငွေ ${dep.amount.toLocaleString()} MMK သွင်းမှု ပယ်ချပြီ\nTxn: ${dep.transactionId}${reasonText}`).catch(()=>{});
     res.json({success:true});
   } catch(e){ res.status(500).json({error:e.message}); }
 });
