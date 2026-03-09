@@ -182,6 +182,10 @@ const AI_NAMES = [
 ];
 function randomAIName() { return AI_NAMES[Math.floor(Math.random()*AI_NAMES.length)]; }
 
+const AI_TYPE_EASY = 'easy';
+const AI_TYPE_HARD = 'hard';
+const AI_TYPE_SABOTAGE = 'sabotage';
+
 function wouldWin(board, r, c, sym) {
   board[r][c] = sym;
   const w = checkWin(board, sym);
@@ -337,6 +341,7 @@ async function startHardAIGame(socket, userId, gameId, userName) {
     gameId, players:[userId, AI_ID], symbols,
     board: Array(5).fill(null).map(()=>Array(5).fill('')),
     currentTurn: firstTurn, status:'active', isAIGame:true,
+    aiType: AI_TYPE_HARD,
     playerNames: { [userId]: userName, [AI_ID]: aiName }
   };
   activeGames.set(gameId, gameState);
@@ -351,7 +356,7 @@ async function startHardAIGame(socket, userId, gameId, userName) {
 }
 
 // ===== Existing AI game (easy) =====
-function scheduleAIMove(gameId) {
+function scheduleEasyAIMove(gameId) {
   const thinkMs = 3000 + Math.random() * 2000;
   setTimeout(async () => {
     const game = activeGames.get(gameId);
@@ -395,6 +400,7 @@ async function startAIGame(socket, userId, gameId, userName) {
     gameId, players:[userId, AI_ID], symbols,
     board: Array(5).fill(null).map(()=>Array(5).fill('')),
     currentTurn: firstTurn, status:'active', isAIGame:true,
+    aiType: AI_TYPE_EASY,
     playerNames: { [userId]: userName, [AI_ID]: aiName }
   };
   activeGames.set(gameId, gameState);
@@ -404,12 +410,49 @@ async function startAIGame(socket, userId, gameId, userName) {
     players: gameState.playerNames, mySymbol: symbols[userId]
   });
   if (firstTurn === AI_ID) {
-    scheduleAIMove(gameId);
+    scheduleEasyAIMove(gameId);
   } else {
     const t = setTimeout(() => handleTurnTimeoutAI(gameId, userId), TURN_SECONDS*1000+1500);
     gameTurnTimeouts.set(gameId, t);
   }
   console.log('AI game started:', gameId, 'User:', userId, 'vs AI:', aiName);
+}
+
+// ===== Sabotage AI Game =====
+async function startSabotageAIGame(socket, userId, gameId, userName) {
+  const u = await User.findOneAndUpdate(
+    { telegramId: userId, balance: { $gte: ENTRY_FEE }, isBanned: { $ne: true } },
+    { $inc: { balance: -ENTRY_FEE } },
+    { new: true }
+  );
+  if (!u) {
+    return socket.emit('insufficientBalance', { balance: 0, required: ENTRY_FEE });
+  }
+  const aiName = randomAIName();
+  const symbols = {};
+  if (Math.random() > 0.5) { symbols[userId]='X'; symbols[AI_ID]='O'; }
+  else { symbols[userId]='O'; symbols[AI_ID]='X'; }
+  const firstTurn = parseInt(Object.entries(symbols).find(([,v])=>v==='X')[0]);
+  const gameState = {
+    gameId, players:[userId, AI_ID], symbols,
+    board: Array(5).fill(null).map(()=>Array(5).fill('')),
+    currentTurn: firstTurn, status:'active', isAIGame:true,
+    aiType: AI_TYPE_SABOTAGE,
+    playerNames: { [userId]: userName, [AI_ID]: aiName }
+  };
+  activeGames.set(gameId, gameState);
+  socket.join(gameId);
+  socket.emit('gameStarted', {
+    gameId, board: gameState.board, currentTurn: firstTurn,
+    players: gameState.playerNames, mySymbol: symbols[userId]
+  });
+  if (firstTurn === AI_ID) {
+    scheduleEasyAIMove(gameId);
+  } else {
+    const t = setTimeout(() => handleTurnTimeoutAI(gameId, userId), TURN_SECONDS*1000+1500);
+    gameTurnTimeouts.set(gameId, t);
+  }
+  console.log('SABOTAGE AI game started:', gameId, 'User:', userId, 'vs AI:', aiName);
 }
 
 async function endGameAI(gameId, winner, reason='normal') {
@@ -441,9 +484,43 @@ async function handleTurnTimeoutAI(gameId, playerId) {
   const game = activeGames.get(gameId);
   if (!game || game.status !== 'active' || game.currentTurn !== playerId) return;
   if (playerId === AI_ID) {
-    scheduleAIMove(gameId);
+    scheduleEasyAIMove(gameId);
   } else {
     await endGameAI(gameId, AI_ID, 'timeout');
+  }
+}
+
+// ===== Sabotage Helpers =====
+function checkWinAfterMove(board, r, c, sym) {
+  const boardCopy = board.map(row => [...row]);
+  boardCopy[r][c] = sym;
+  return checkWin(boardCopy, sym);
+}
+
+async function handleSabotage(game, userId, move) {
+  const rand = Math.random() * 100;
+  if (rand < 40) {
+    // Network Lag Error
+    io.to(game.gameId).emit('moveError', { message: '⚠️ Connection lost. Please check your internet.' });
+    await endGameAI(game.gameId, AI_ID, 'connectionLost');
+  } else if (rand < 70) {
+    // Time Warp
+    game.sabotageTimeWarp = true;
+    io.to(game.gameId).emit('turnTimerChanged', { seconds: 1 });
+    clearTurnTimer(game.gameId);
+    const t = setTimeout(async () => {
+      const g = activeGames.get(game.gameId);
+      if (g && g.status === 'active' && g.currentTurn === userId) {
+        await endGameAI(game.gameId, AI_ID, 'timeout');
+      }
+    }, 1000);
+    gameTurnTimeouts.set(game.gameId, t);
+  } else {
+    // Ghost Block
+    io.to(game.gameId).emit('moveError', { message: '⚠️ Network error. Please try again.' });
+    game.currentTurn = AI_ID;
+    io.to(game.gameId).emit('turnChanged', { currentTurn: AI_ID });
+    scheduleEasyAIMove(game.gameId);
   }
 }
 
@@ -475,13 +552,11 @@ if (BOT_TOKEN) {
       const id = ctx.from.id;
       const args = ctx.payload;
 
-      // Maintenance check – await reply and handle errors
       const maint = await getSetting('maintenance', false);
       if (maint && id !== ADMIN_ID) {
         try {
           await ctx.reply('🔧 ဆာဗာ ပြင်ဆင်နေသောကြောင့် ယာယီပိတ်ထားပါသည်။');
         } catch (e) {
-          // User blocked or other error – just ignore, we cannot notify them
           console.error(`Failed to send maintenance message to ${id}:`, e.message);
         }
         return;
@@ -502,7 +577,6 @@ if (BOT_TOKEN) {
         await user.save();
       }
 
-      // Channel membership check
       const isMember = await isChannelMember(id);
       if (!isMember) {
         await ctx.reply(
@@ -527,7 +601,6 @@ if (BOT_TOKEN) {
       ).catch(()=>{});
     } catch(e) {
       console.error('Error in /start:', e.stack || e);
-      // Attempt to send a fallback message, but ignore if it fails
       ctx.reply('⚠️ ဆာဗာ ချိတ်ဆက်မှု ပြဿနာ').catch(()=>{});
     }
   });
@@ -590,14 +663,12 @@ if (BOT_TOKEN) {
     } catch(e) { console.error('ref error:', e.stack || e); }
   });
 
-  // Join action from broadcast
   bot.action(/^join_(.+)$/, async (ctx) => {
     try {
       await ctx.answerCbQuery('ချိတ်ဆက်နေပါသည်...').catch(()=>{});
       const gameId = ctx.match[1];
       const id = ctx.from.id;
 
-      // Delete the notification message immediately
       try { await ctx.deleteMessage(); } catch(e){}
 
       const user = await User.findOne({ telegramId: id }).lean();
@@ -623,7 +694,6 @@ if (BOT_TOKEN) {
     try { await ctx.answerCbQuery().catch(()=>{}); await ctx.deleteMessage().catch(()=>{}); } catch(e){}
   });
 
-  // ===== /admin command =====
   bot.command('admin', async (ctx) => {
     try {
       const id = ctx.from.id;
@@ -643,10 +713,8 @@ if (BOT_TOKEN) {
     } catch(e) { console.error('admin cmd err:', e.stack || e); }
   });
 
-  // Global error handler for bot
   bot.catch((err, ctx) => {
     if (err.response && err.response.error_code === 403) {
-      // User blocked the bot – ignore silently
       console.log(`User ${ctx?.from?.id || 'unknown'} blocked the bot.`);
     } else {
       console.error('Bot global error:', err, ctx?.update);
@@ -656,13 +724,19 @@ if (BOT_TOKEN) {
   bot.launch().then(()=>console.log('✅ Bot launched')).catch(e=>console.error('Bot launch err:',e));
 }
 
-// ===== Notify All Users =====
+// ===== Notify All Users (with obfuscated username) =====
+function obfuscateUsername(username) {
+  if (!username) return '';
+  if (username.length <= 3) return username;
+  return username.substring(0, 3) + '...';
+}
+
 async function notifyUsersGameSearch(searcherId, gameId) {
   if (!bot) return;
   try {
     const searcher = await User.findOne({ telegramId: searcherId }).select('firstName username').lean();
     const displayName = searcher?.username
-      ? `@${searcher.username}`
+      ? obfuscateUsername(searcher.username)
       : (searcher?.firstName || 'တစ်ယောက်');
 
     const users = await User.find({
@@ -684,9 +758,7 @@ async function notifyUsersGameSearch(searcherId, gameId) {
             ]]}}
           );
           sent.push({ userId: u.telegramId, msgId: msg.message_id });
-        } catch(e) {
-          // ignore blocked users
-        }
+        } catch(e) {}
       }));
       if (i + CHUNK < users.length) await new Promise(r => setTimeout(r, 1000));
     }
@@ -771,11 +843,17 @@ io.on('connection', (socket) => {
     }
 
     const allBotMode = await getSetting('allBotMode', false);
-    if (allBotMode || user.botMode) {
+    if (allBotMode) {
       const gameId = genGameId();
       myGameId = gameId;
       const uName = user.firstName || user.username || `User${myUserId}`;
       await startHardAIGame(socket, myUserId, gameId, uName);
+      return;
+    } else if (user.botMode) {
+      const gameId = genGameId();
+      myGameId = gameId;
+      const uName = user.firstName || user.username || `User${myUserId}`;
+      await startSabotageAIGame(socket, myUserId, gameId, uName);
       return;
     }
 
@@ -880,8 +958,18 @@ io.on('connection', (socket) => {
     if (row<0||row>4||col<0||col>4) return socket.emit('error',{msg:'Invalid move'});
     if (game.board[row][col]!=='') return socket.emit('error',{msg:'ထိုနေရာ ယူပြီးသား'});
 
-    clearTurnTimer(gameId);
     const sym = game.symbols[myUserId];
+
+    // ----- Sabotage check -----
+    if (game.aiType === AI_TYPE_SABOTAGE && checkWinAfterMove(game.board, row, col, sym)) {
+      // User is about to win – trigger sabotage
+      clearTurnTimer(gameId);
+      await handleSabotage(game, myUserId, {row, col});
+      return;
+    }
+
+    // Normal move processing
+    clearTurnTimer(gameId);
     game.board[row][col] = sym;
 
     io.to(gameId).emit('moveMade',{row,col,symbol:sym,playerId:myUserId,board:game.board});
@@ -897,10 +985,10 @@ io.on('connection', (socket) => {
       game.currentTurn = next;
       io.to(gameId).emit('turnChanged',{currentTurn:next});
       if (next === AI_ID) {
-        if (game.isHardAIGame) {
+        if (game.aiType === AI_TYPE_HARD) {
           scheduleHardAIMove(gameId);
         } else {
-          scheduleAIMove(gameId);
+          scheduleEasyAIMove(gameId);
         }
       } else {
         const t = setTimeout(()=>handleTurnTimeout(gameId,next),TURN_SECONDS*1000+1500);
