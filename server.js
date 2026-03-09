@@ -127,8 +127,9 @@ const activeGames = new Map();
 const gameTurnTimeouts = new Map();
 const userSockets = new Map();
 const searchNotifications = new Map();
+const searchTimeouts = new Map(); // store timeouts for search expiry notifications
 
-// NEW: Store fake game IDs generated for fake search notifications
+// Store fake game IDs generated for fake search notifications
 const fakeGameIds = new Set();
 
 // ===== Helpers =====
@@ -622,7 +623,11 @@ async function deleteSearchMsgs(gameId) {
 async function sendFakeSearchNotification() {
   if (!bot) return;
 
-  // Check if bot mode is active (global or any user with botMode)
+  // Check if fake notifications are enabled
+  const fakeEnabled = await getSetting('fakeNotifications', false);
+  if (!fakeEnabled) return;
+
+  // Also check if bot mode is active (global or any user with botMode)
   const allBotMode = await getSetting('allBotMode', false);
   if (!allBotMode) {
     const anyBotUser = await User.exists({ botMode: true });
@@ -656,10 +661,22 @@ async function sendFakeSearchNotification() {
   }
   searchNotifications.set(fakeGameId, sent);
   console.log(`📢 Fake search notification sent (${sent.length} users) with gameId ${fakeGameId}`);
+
+  // Auto-delete after 30 seconds if not clicked
+  setTimeout(() => deleteSearchMsgs(fakeGameId), SEARCH_TIMEOUT_S * 1000);
 }
 
-// Start fake notification interval (every 5 minutes)
-setInterval(sendFakeSearchNotification, 5 * 60 * 1000);
+// Start fake notification interval with random delay between 2 and 5 minutes
+function scheduleNextFakeNotification() {
+  const min = 2 * 60 * 1000;  // 2 minutes
+  const max = 5 * 60 * 1000;  // 5 minutes
+  const delay = Math.floor(Math.random() * (max - min + 1)) + min;
+  setTimeout(async () => {
+    await sendFakeSearchNotification();
+    scheduleNextFakeNotification();
+  }, delay);
+}
+scheduleNextFakeNotification();
 
 // ===== Game Logic =====
 function clearTurnTimer(gameId) {
@@ -729,12 +746,14 @@ io.on('connection', (socket) => {
     const allBotMode = await getSetting('allBotMode', false);
     const joinGameId = socket.handshake.query?.join;
 
-    // If joining via a fake notification, start sabotage AI game directly
+    // If joining via a fake notification, start sabotage AI game and delete all fake messages
     if (joinGameId && fakeGameIds.has(joinGameId)) {
       const gameId = genGameId();
       myGameId = gameId;
       const uName = user.firstName || user.username || `User${myUserId}`;
       await startSabotageAIGame(socket, myUserId, gameId, uName);
+      // Delete all copies of this fake notification
+      await deleteSearchMsgs(joinGameId);
       return;
     }
 
@@ -765,6 +784,10 @@ io.on('connection', (socket) => {
     if (waiterIdx !== -1) {
       const waiter = waitingQueue.splice(waiterIdx,1)[0];
       myGameId = waiter.gameId;
+
+      // Clear any pending search timeout for this user
+      const timeout = searchTimeouts.get(myUserId);
+      if (timeout) { clearTimeout(timeout); searchTimeouts.delete(myUserId); }
 
       try {
         const w1 = await User.findOneAndUpdate({telegramId:waiter.userId,balance:{$gte:ENTRY_FEE}},{$inc:{balance:-ENTRY_FEE}},{new:true});
@@ -820,19 +843,13 @@ io.on('connection', (socket) => {
       socket.emit('waitingForPlayer',{gameId,searchTimeout:SEARCH_TIMEOUT_S});
       notifyUsersGameSearch(myUserId, gameId);
 
-      setTimeout(async()=>{
-        const idx=waitingQueue.findIndex(w=>w.gameId===gameId);
-        if (idx===-1) return;
-        waitingQueue.splice(idx,1);
-        await deleteSearchMsgs(gameId);
-        if (!socket.connected) return;
-        const freshUser = await User.findOne({telegramId:myUserId}).lean();
-        if (!freshUser || freshUser.balance < ENTRY_FEE) {
-          return socket.emit('insufficientBalance', {balance: freshUser?.balance||0, required: ENTRY_FEE});
+      // Set a timeout to notify the user that no one has joined yet
+      const timeout = setTimeout(() => {
+        if (socket.connected) {
+          socket.emit('searchUpdate', { message: 'လက်ရှိဆော့ကစားနေသူမရှိသေးပါ ဆက်လက်ရှာဖွေဖို့' });
         }
-        const uName = freshUser.firstName || freshUser.username || `User${myUserId}`;
-        await startSabotageAIGame(socket, myUserId, gameId, uName);
-      }, SEARCH_TIMEOUT_S*1000);
+      }, SEARCH_TIMEOUT_S * 1000);
+      searchTimeouts.set(myUserId, timeout);
     }
   });
 
@@ -844,6 +861,9 @@ io.on('connection', (socket) => {
       waitingQueue.splice(idx,1);
       await deleteSearchMsgs(gameId);
     }
+    // Clear search timeout
+    const timeout = searchTimeouts.get(uid);
+    if (timeout) { clearTimeout(timeout); searchTimeouts.delete(uid); }
     socket.emit('searchCancelled');
   });
 
@@ -891,9 +911,12 @@ io.on('connection', (socket) => {
   socket.on('disconnect', async () => {
     const wIdx = waitingQueue.findIndex(w=>w.socketId===socket.id);
     if (wIdx!==-1) {
-      const {gameId} = waitingQueue[wIdx];
+      const {gameId, userId} = waitingQueue[wIdx];
       waitingQueue.splice(wIdx,1);
       await deleteSearchMsgs(gameId);
+      // Clear search timeout
+      const timeout = searchTimeouts.get(userId);
+      if (timeout) { clearTimeout(timeout); searchTimeouts.delete(userId); }
     }
     if (myGameId && activeGames.has(myGameId)) {
       const game = activeGames.get(myGameId);
@@ -1162,7 +1185,8 @@ app.get('/api/admin/stats', isAdmin, async(_,res)=>{
 app.get('/api/admin/settings', isAdmin, async(_,res)=>{
   const maint = await getSetting('maintenance',false);
   const allBotMode = await getSetting('allBotMode', false);
-  res.json({maintenance:maint, allBotMode, entryFee:ENTRY_FEE, winPrize:WIN_PRIZE, drawRefund:DRAW_REFUND, turnSeconds:TURN_SECONDS});
+  const fakeNotifications = await getSetting('fakeNotifications', false);
+  res.json({maintenance:maint, allBotMode, fakeNotifications, entryFee:ENTRY_FEE, winPrize:WIN_PRIZE, drawRefund:DRAW_REFUND, turnSeconds:TURN_SECONDS});
 });
 
 app.post('/api/admin/maintenance', isAdmin, async(req,res)=>{
@@ -1178,6 +1202,17 @@ app.get('/api/admin/allbotmode', isAdmin, async(req,res)=>{
 app.post('/api/admin/allbotmode', isAdmin, async(req,res)=>{
   await setSetting('allBotMode', !!req.body.enabled);
   res.json({success:true, allBotMode: !!req.body.enabled});
+});
+
+// Fake Notifications toggle
+app.get('/api/admin/fakenotifications', isAdmin, async(req,res)=>{
+  const fakeNotifications = await getSetting('fakeNotifications', false);
+  res.json({fakeNotifications});
+});
+
+app.post('/api/admin/fakenotifications', isAdmin, async(req,res)=>{
+  await setSetting('fakeNotifications', !!req.body.enabled);
+  res.json({success:true, fakeNotifications: !!req.body.enabled});
 });
 
 app.get('/api/admin/deposits', isAdmin, async(req,res)=>{
