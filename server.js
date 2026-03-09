@@ -275,6 +275,7 @@ async function endGameAI(gameId, winner, reason='normal') {
       winnerName: winner===-1 ? 'draw' : (game.playerNames?.[winner] || String(winner)),
       isAIGame: !!game.isAIGame
     },{upsert:true});
+  } catch(e){ console.error('endGameAI err:',e); }
   io.to(gameId).emit('gameOver', { winner, reason, board:game.board });
   activeGames.delete(gameId);
 }
@@ -563,6 +564,8 @@ async function endGame(gameId, winner, reason='normal') {
       isAIGame: !!game.isAIGame
     },{upsert:true});
   } catch(e){ console.error('endGame err:',e); }
+
+  io.to(gameId).emit('gameOver',{winner,reason,board:game.board});
   activeGames.delete(gameId);
   setTimeout(()=>deleteSearchMsgs(gameId),500);
 }
