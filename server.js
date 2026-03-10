@@ -576,8 +576,8 @@ function obfuscateUsername(username) {
 async function notifyUsersGameSearch(searcherId, gameId) {
   if (!bot) return;
   try {
-    // Run BOTH DB queries at the same time (parallel) — no sequential wait
-    const [searcher, users] = await Promise.all([
+    // ① DB queries တပြိုင်နက် run (parallel)
+    const [searcher, allUsers] = await Promise.all([
       User.findOne({ telegramId: searcherId }).select('firstName username').lean(),
       User.find({ telegramId: { $ne: searcherId }, isBanned: { $ne: true } }).select('telegramId').lean()
     ]);
@@ -592,27 +592,48 @@ async function notifyUsersGameSearch(searcherId, gameId) {
       { text:'❌ မကစားဘူး', callback_data:'dismiss' }
     ]]};
 
-    const sent = [];
-    const CHUNK = 30;
-    for (let i = 0; i < users.length; i += CHUNK) {
-      // Stop early if game was already matched or cancelled
-      if (!waitingQueue.find(w => w.gameId === gameId)) break;
+    // ② Online (socket ချိတ်ဆက်ထားသူ) နဲ့ Offline ကို ခွဲ
+    const onlineUsers  = allUsers.filter(u => userSockets.has(u.telegramId));
+    const offlineUsers = allUsers.filter(u => !userSockets.has(u.telegramId));
 
-      const batch = users.slice(i, i + CHUNK);
-      await Promise.allSettled(batch.map(async u => {
-        try {
-          const msg = await bot.telegram.sendMessage(u.telegramId, msgText,
-            { parse_mode:'HTML', reply_markup: replyMarkup }
-          );
-          sent.push({ userId: u.telegramId, msgId: msg.message_id });
-        } catch(e) {}
-      }));
-      // Small gap between chunks to respect Telegram rate limit
-      if (i + CHUNK < users.length) await new Promise(r => setTimeout(r, 100));
-    }
+    const sent = [];
+
+    // ③ ONLINE users → ချက်ချင်း တပြိုင်နက် ပို့ (delay မပါ)
+    const onlineResults = await Promise.allSettled(onlineUsers.map(async u => {
+      try {
+        const msg = await bot.telegram.sendMessage(u.telegramId, msgText,
+          { parse_mode:'HTML', reply_markup: replyMarkup }
+        );
+        return { userId: u.telegramId, msgId: msg.message_id };
+      } catch(e) { return null; }
+    }));
+    onlineResults.forEach(r => { if (r.status === 'fulfilled' && r.value) sent.push(r.value); });
+
+    // ④ OFFLINE users → background မှာ chunk ခွဲပြီး ဖြည်းဖြည်းချင်း ပို့
+    //    setImmediate နဲ့ defer လုပ်ထားတာကြောင့် online notify ပြီးတာနဲ့ return ဖြစ်မည်
+    setImmediate(async () => {
+      const CHUNK = 25;
+      for (let i = 0; i < offlineUsers.length; i += CHUNK) {
+        // Game match ဖြစ်ပြီး / cancel ဆိုရင် ရပ်
+        if (!waitingQueue.find(w => w.gameId === gameId)) break;
+
+        const batch = offlineUsers.slice(i, i + CHUNK);
+        await Promise.allSettled(batch.map(async u => {
+          try {
+            const msg = await bot.telegram.sendMessage(u.telegramId, msgText,
+              { parse_mode:'HTML', reply_markup: replyMarkup }
+            );
+            sent.push({ userId: u.telegramId, msgId: msg.message_id });
+          } catch(e) {}
+        }));
+        // Telegram rate limit မကျော်အောင် 200ms
+        if (i + CHUNK < offlineUsers.length) await new Promise(r => setTimeout(r, 200));
+      }
+      console.log(`📢 Offline notify done. Total: ${sent.length}/${allUsers.length} for game ${gameId}`);
+    });
 
     searchNotifications.set(gameId, sent);
-    console.log(`📢 Notified ${sent.length}/${users.length} users for game ${gameId}`);
+    console.log(`📢 Online: ${onlineUsers.length} notified instantly | Offline: ${offlineUsers.length} queued`);
   } catch(e){ console.error('notify err:', e.stack || e); }
 }
 
