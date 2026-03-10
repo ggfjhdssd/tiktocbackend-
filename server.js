@@ -34,7 +34,7 @@ const BOT_USERNAME = process.env.BOT_USERNAME || 'tictoe1_bot';
 const ENTRY_FEE = 1000;
 const WIN_PRIZE = 1600;
 const DRAW_REFUND = 500;
-const TURN_SECONDS = 60; // ✅ CHANGED: 10 → 60
+const TURN_SECONDS = 10;
 const SEARCH_TIMEOUT_S = 60;
 
 // ===== MongoDB =====
