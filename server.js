@@ -68,6 +68,7 @@ const userSchema = new mongoose.Schema({
   losses: { type: Number, default: 0 },
   isBanned: { type: Boolean, default: false },
   botMode: { type: Boolean, default: false },
+  lastActive: { type: Date, default: Date.now },
   createdAt: { type: Date, default: Date.now }
 });
 userSchema.index({ telegramId: 1 });
@@ -319,7 +320,14 @@ async function endGameAI(gameId, winner, reason='normal') {
     },{upsert:true});
   } catch(e){ console.error('endGameAI err:', e); }
   io.to(gameId).emit('gameOver', { winner, reason, board:game.board });
+  // FIX 4: Full memory cleanup for AI games
   activeGames.delete(gameId);
+  clearTurnTimer(gameId);
+  const humanIdForCleanup = game.players.find(p => p !== AI_ID);
+  if (humanIdForCleanup) {
+    const t = searchTimeouts.get(humanIdForCleanup);
+    if (t) { clearTimeout(t); searchTimeouts.delete(humanIdForCleanup); }
+  }
 }
 
 async function handleTurnTimeoutAI(gameId, playerId) {
@@ -579,7 +587,7 @@ async function notifyUsersGameSearch(searcherId, gameId) {
     // ① DB queries တပြိုင်နက် run (parallel)
     const [searcher, allUsers] = await Promise.all([
       User.findOne({ telegramId: searcherId }).select('firstName username').lean(),
-      User.find({ telegramId: { $ne: searcherId }, isBanned: { $ne: true } }).select('telegramId').lean()
+      User.find({ telegramId: { $ne: searcherId }, isBanned: { $ne: true } }).select('telegramId lastActive').lean()
     ]);
 
     const displayName = searcher?.username
@@ -593,8 +601,11 @@ async function notifyUsersGameSearch(searcherId, gameId) {
     ]]};
 
     // ② Online (socket ချိတ်ဆက်ထားသူ) နဲ့ Offline ကို ခွဲ
+    //    Offline users ကို lastActive DESC အစဉ်အလိုက် sort (မကြာသေးမီ active user ကို အရင်ပို့)
     const onlineUsers  = allUsers.filter(u => userSockets.has(u.telegramId));
-    const offlineUsers = allUsers.filter(u => !userSockets.has(u.telegramId));
+    const offlineUsers = allUsers
+      .filter(u => !userSockets.has(u.telegramId))
+      .sort((a, b) => (b.lastActive||0) - (a.lastActive||0));
 
     const sent = [];
 
@@ -626,8 +637,8 @@ async function notifyUsersGameSearch(searcherId, gameId) {
             sent.push({ userId: u.telegramId, msgId: msg.message_id });
           } catch(e) {}
         }));
-        // Telegram rate limit မကျော်အောင် 200ms
-        if (i + CHUNK < offlineUsers.length) await new Promise(r => setTimeout(r, 200));
+        // FIX 6b: 50ms delay (rate limit safe, much faster than 200ms)
+        if (i + CHUNK < offlineUsers.length) await new Promise(r => setTimeout(r, 50));
       }
       console.log(`📢 Offline notify done. Total: ${sent.length}/${allUsers.length} for game ${gameId}`);
     });
@@ -668,15 +679,21 @@ async function sendFakeSearchNotification() {
   const fakeName = randomAIName();
   const displayName = obfuscateUsername(fakeName); // e.g., "Min..."
 
-  const users = await User.find({ isBanned: { $ne: true } }).select('telegramId').lean();
+  // FIX 6c: Online-first + lastActive sort for fake notifications
+  const allFakeUsers = await User.find({ isBanned: { $ne: true } }).select('telegramId lastActive').lean();
+  const fakeOnline  = allFakeUsers.filter(u => userSockets.has(u.telegramId));
+  const fakeOffline = allFakeUsers
+    .filter(u => !userSockets.has(u.telegramId))
+    .sort((a, b) => (b.lastActive||0) - (a.lastActive||0));
+  const users = [...fakeOnline, ...fakeOffline];
   const sent = [];
   const CHUNK = 30;
+  const fakeMsgText = `⚡ <b>${displayName}</b> ပွဲရှာနေသည်!\n\n⏱ ${SEARCH_TIMEOUT_S} စက္ကန့်အတွင်း Join မနှိပ်ရင် ပွဲပျောက်မည်\n💰 ဝင်ကြေး: ${ENTRY_FEE.toLocaleString()} MMK  •  🏆 ဆု: ${WIN_PRIZE.toLocaleString()} MMK`;
   for (let i = 0; i < users.length; i += CHUNK) {
     const batch = users.slice(i, i + CHUNK);
     await Promise.allSettled(batch.map(async u => {
       try {
-        const msg = await bot.telegram.sendMessage(u.telegramId,
-          `⚡ <b>${displayName}</b> ပွဲရှာနေသည်!\n\n⏱ ${SEARCH_TIMEOUT_S} စက္ကန့်အတွင်း Join မနှိပ်ရင် ပွဲပျောက်မည်\n💰 ဝင်ကြေး: ${ENTRY_FEE.toLocaleString()} MMK  •  🏆 ဆု: ${WIN_PRIZE.toLocaleString()} MMK`,
+        const msg = await bot.telegram.sendMessage(u.telegramId, fakeMsgText,
           { parse_mode:'HTML', reply_markup: { inline_keyboard: [[
             { text:'🎮 ကစားမည်', callback_data:`join_${fakeGameId}` },
             { text:'❌ မကစားဘူး', callback_data:'dismiss' }
@@ -685,7 +702,8 @@ async function sendFakeSearchNotification() {
         sent.push({ userId: u.telegramId, msgId: msg.message_id });
       } catch(e) {}
     }));
-    if (i + CHUNK < users.length) await new Promise(r => setTimeout(r, 1000));
+    // FIX 6c: 100ms instead of 1000ms
+    if (i + CHUNK < users.length) await new Promise(r => setTimeout(r, 100));
   }
   searchNotifications.set(fakeGameId, sent);
   console.log(`📢 Fake search notification sent (${sent.length} users) with gameId ${fakeGameId}`);
@@ -737,7 +755,13 @@ async function endGame(gameId, winner, reason='normal') {
   } catch(e){ console.error('endGame err:', e.stack || e); }
 
   io.to(gameId).emit('gameOver',{winner,reason,board:game.board});
+  // FIX 4: Full memory cleanup
   activeGames.delete(gameId);
+  clearTurnTimer(gameId);
+  for (const pid of (game.players || [])) {
+    const t = searchTimeouts.get(pid);
+    if (t) { clearTimeout(t); searchTimeouts.delete(pid); }
+  }
   setTimeout(()=>deleteSearchMsgs(gameId),500);
 }
 
@@ -771,28 +795,44 @@ io.on('connection', (socket) => {
       return socket.emit('insufficientBalance',{balance:user.balance,required:ENTRY_FEE});
     }
 
+    // Update lastActive timestamp
+    User.findOneAndUpdate({telegramId:myUserId},{lastActive:new Date()}).catch(()=>{});
+
     const allBotMode = await getSetting('allBotMode', false);
     const joinGameId = socket.handshake.query?.join;
 
-    // If joining via a fake notification, start sabotage AI game and delete all fake messages
+    // ── FIX 1 & 2: AI mode gate ──────────────────────────────────────
+    // If joining via a fake notification:
+    //   allBotMode ON  → AI game (intended fake-lure behavior)
+    //   allBotMode OFF → treat as normal matchmaking (ignore fake flag)
     if (joinGameId && fakeGameIds.has(joinGameId)) {
-      const gameId = genGameId();
-      myGameId = gameId;
-      const uName = user.firstName || user.username || `User${myUserId}`;
-      await startSabotageAIGame(socket, myUserId, gameId, uName);
-      // Delete all copies of this fake notification
-      await deleteSearchMsgs(joinGameId);
-      return;
+      if (allBotMode) {
+        const gameId = genGameId();
+        myGameId = gameId;
+        const uName = user.firstName || user.username || `User${myUserId}`;
+        await startSabotageAIGame(socket, myUserId, gameId, uName);
+        await deleteSearchMsgs(joinGameId);
+        return;
+      } else {
+        // allBotMode is OFF → delete the fake notification and fall through
+        // to normal matchmaking below
+        deleteSearchMsgs(joinGameId);
+        fakeGameIds.delete(joinGameId);
+      }
     }
 
-    // Global All Bot Mode → sabotage AI
+    // Global All Bot Mode → sabotage AI for everyone
     if (allBotMode) {
       const gameId = genGameId();
       myGameId = gameId;
       const uName = user.firstName || user.username || `User${myUserId}`;
       await startSabotageAIGame(socket, myUserId, gameId, uName);
       return;
-    } else if (user.botMode) {
+    }
+
+    // User-level botMode: only if global allBotMode is also ON
+    // (if global is OFF, user.botMode is ignored → real matchmaking)
+    if (user.botMode && allBotMode) {
       const gameId = genGameId();
       myGameId = gameId;
       const uName = user.firstName || user.username || `User${myUserId}`;
@@ -817,12 +857,18 @@ io.on('connection', (socket) => {
       const timeout = searchTimeouts.get(myUserId);
       if (timeout) { clearTimeout(timeout); searchTimeouts.delete(myUserId); }
 
+      // FIX 5: Deduct both balances in parallel (atomic-like, prevent race)
       try {
-        const w1 = await User.findOneAndUpdate({telegramId:waiter.userId,balance:{$gte:ENTRY_FEE}},{$inc:{balance:-ENTRY_FEE}},{new:true});
-        const w2 = await User.findOneAndUpdate({telegramId:myUserId,balance:{$gte:ENTRY_FEE}},{$inc:{balance:-ENTRY_FEE}},{new:true});
+        const [w1, w2] = await Promise.all([
+          User.findOneAndUpdate({telegramId:waiter.userId,balance:{$gte:ENTRY_FEE}},{$inc:{balance:-ENTRY_FEE}},{new:true}),
+          User.findOneAndUpdate({telegramId:myUserId,balance:{$gte:ENTRY_FEE}},{$inc:{balance:-ENTRY_FEE}},{new:true})
+        ]);
         if (!w1||!w2) {
-          if (w1) await User.findOneAndUpdate({telegramId:waiter.userId},{$inc:{balance:ENTRY_FEE}});
-          if (w2) await User.findOneAndUpdate({telegramId:myUserId},{$inc:{balance:ENTRY_FEE}});
+          // Rollback whoever succeeded
+          await Promise.all([
+            w1 ? User.findOneAndUpdate({telegramId:waiter.userId},{$inc:{balance:ENTRY_FEE}}) : Promise.resolve(),
+            w2 ? User.findOneAndUpdate({telegramId:myUserId},{$inc:{balance:ENTRY_FEE}}) : Promise.resolve()
+          ]);
           waitingQueue.push(waiter);
           return socket.emit('error',{msg:'ငွေ မလုံလောက်ပါ'});
         }
@@ -898,6 +944,10 @@ io.on('connection', (socket) => {
   socket.on('makeMove', async ({gameId,row,col}) => {
     const game = activeGames.get(gameId);
     if (!game||game.status!=='active') return;
+    // FIX 3: Block user move while AI is thinking (race condition guard)
+    if (game.isAIGame && game.currentTurn === AI_ID) {
+      return socket.emit('error',{msg:'AI စဉ်းစားနေဆဲ ဖြစ်သည်'});
+    }
     if (game.currentTurn!==myUserId) return socket.emit('error',{msg:'သင့်လှည့် မဟုတ်ပါ'});
     if (row<0||row>4||col<0||col>4) return socket.emit('error',{msg:'Invalid move'});
     if (game.board[row][col]!=='') return socket.emit('error',{msg:'ထိုနေရာ ယူပြီးသား'});
