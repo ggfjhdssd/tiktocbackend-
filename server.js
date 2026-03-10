@@ -34,7 +34,7 @@ const BOT_USERNAME = process.env.BOT_USERNAME || 'tictoe1_bot';
 const ENTRY_FEE = 1000;
 const WIN_PRIZE = 1600;
 const DRAW_REFUND = 500;
-const TURN_SECONDS = 10;
+const TURN_SECONDS = 60; // ✅ CHANGED: 10 → 60
 const SEARCH_TIMEOUT_S = 60;
 
 // ===== MongoDB =====
@@ -1078,34 +1078,15 @@ io.on('connection', (socket) => {
       const timeout = searchTimeouts.get(userId);
       if (timeout) { clearTimeout(timeout); searchTimeouts.delete(userId); }
     }
+    // ✅ CHANGED: Instant loss on disconnect — no 30s reconnect window
     if (myGameId && activeGames.has(myGameId)) {
       const game = activeGames.get(myGameId);
-      if (game?.status==='active') {
+      if (game?.status === 'active') {
         if (game.isAIGame) {
-          setTimeout(async()=>{
-            const g = activeGames.get(myGameId);
-            if (g?.status==='active') {
-              const newSid = userSockets.get(myUserId);
-              if (!newSid||!io.sockets.sockets.get(newSid)) {
-                await endGameAI(myGameId, AI_ID, 'disconnect');
-              }
-            }
-          }, 30000);
+          await endGameAI(myGameId, AI_ID, 'disconnect');
         } else {
-          const opp = game.players.find(p=>p!==myUserId);
-          if (opp) {
-            const oppSid = userSockets.get(opp);
-            if (oppSid) io.to(oppSid).emit('opponentDisconnected',{reconnectWindow:30});
-            setTimeout(async()=>{
-              const g = activeGames.get(myGameId);
-              if (g?.status==='active') {
-                const newSid = userSockets.get(myUserId);
-                if (!newSid||!io.sockets.sockets.get(newSid)) {
-                  await endGame(myGameId,opp,'disconnect');
-                }
-              }
-            },30000);
-          }
+          const opp = game.players.find(p => p !== myUserId);
+          if (opp) await endGame(myGameId, opp, 'disconnect');
         }
       }
     }
@@ -1116,6 +1097,21 @@ io.on('connection', (socket) => {
       moveCooldowns.delete(myUserId);
       findGameCooldowns.delete(myUserId);
     }
+  });
+
+  // ✅ NEW: In-game emote handler
+  socket.on('sendEmote', ({ gameId, emote }) => {
+    try {
+      if (!gameId || !emote || !myUserId) return;
+      const game = activeGames.get(gameId);
+      if (!game || game.status !== 'active') return;
+      if (!game.players.includes(myUserId)) return;
+      // Broadcast emote to the game room with sender info
+      io.to(gameId).emit('emoteReceived', {
+        senderId: myUserId,
+        emote
+      });
+    } catch(e) { console.error('emote err:', e); }
   });
 
   async function handleTurnTimeout(gameId, playerId) {
