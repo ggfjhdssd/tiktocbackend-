@@ -575,45 +575,45 @@ function obfuscateUsername(username) {
 
 async function notifyUsersGameSearch(searcherId, gameId) {
   if (!bot) return;
-  // Run entirely in background - don't block the caller
-  setImmediate(async () => {
-    try {
-      const searcher = await User.findOne({ telegramId: searcherId }).select('firstName username').lean();
-      const displayName = searcher?.username
-        ? obfuscateUsername(searcher.username)
-        : (searcher?.firstName || 'တစ်ယောက်');
+  try {
+    // Run BOTH DB queries at the same time (parallel) — no sequential wait
+    const [searcher, users] = await Promise.all([
+      User.findOne({ telegramId: searcherId }).select('firstName username').lean(),
+      User.find({ telegramId: { $ne: searcherId }, isBanned: { $ne: true } }).select('telegramId').lean()
+    ]);
 
-      const users = await User.find({
-        telegramId: { $ne: searcherId },
-        isBanned: { $ne: true }
-      }).select('telegramId').lean();
+    const displayName = searcher?.username
+      ? obfuscateUsername(searcher.username)
+      : (searcher?.firstName || 'တစ်ယောက်');
 
-      const sent = [];
-      const CHUNK = 30;
-      for (let i = 0; i < users.length; i += CHUNK) {
-        // Stop sending if game already matched or cancelled
-        if (!waitingQueue.find(w => w.gameId === gameId)) break;
+    const msgText = `⚡ <b>${displayName}</b> ပွဲရှာနေသည်!\n\n⏱ ${SEARCH_TIMEOUT_S} စက္ကန့်အတွင်း Join မနှိပ်ရင် ပွဲပျောက်မည်\n💰 ဝင်ကြေး: ${ENTRY_FEE.toLocaleString()} MMK  •  🏆 ဆု: ${WIN_PRIZE.toLocaleString()} MMK`;
+    const replyMarkup = { inline_keyboard: [[
+      { text:'🎮 ကစားမည်', callback_data:`join_${gameId}` },
+      { text:'❌ မကစားဘူး', callback_data:'dismiss' }
+    ]]};
 
-        const batch = users.slice(i, i + CHUNK);
-        await Promise.allSettled(batch.map(async u => {
-          try {
-            const msg = await bot.telegram.sendMessage(u.telegramId,
-              `⚡ <b>${displayName}</b> ပွဲရှာနေသည်!\n\n⏱ ${SEARCH_TIMEOUT_S} စက္ကန့်အတွင်း Join မနှိပ်ရင် ပွဲပျောက်မည်\n💰 ဝင်ကြေး: ${ENTRY_FEE.toLocaleString()} MMK  •  🏆 ဆု: ${WIN_PRIZE.toLocaleString()} MMK`,
-              { parse_mode:'HTML', reply_markup: { inline_keyboard: [[
-                { text:'🎮 ကစားမည်', callback_data:`join_${gameId}` },
-                { text:'❌ မကစားဘူး', callback_data:'dismiss' }
-              ]]}}
-            );
-            sent.push({ userId: u.telegramId, msgId: msg.message_id });
-          } catch(e) {}
-        }));
-        // Reduced delay: 100ms between chunks instead of 1000ms
-        if (i + CHUNK < users.length) await new Promise(r => setTimeout(r, 100));
-      }
-      searchNotifications.set(gameId, sent);
-      console.log(`📢 Notified ${sent.length}/${users.length} users for game ${gameId}`);
-    } catch(e){ console.error('notify err:', e.stack || e); }
-  });
+    const sent = [];
+    const CHUNK = 30;
+    for (let i = 0; i < users.length; i += CHUNK) {
+      // Stop early if game was already matched or cancelled
+      if (!waitingQueue.find(w => w.gameId === gameId)) break;
+
+      const batch = users.slice(i, i + CHUNK);
+      await Promise.allSettled(batch.map(async u => {
+        try {
+          const msg = await bot.telegram.sendMessage(u.telegramId, msgText,
+            { parse_mode:'HTML', reply_markup: replyMarkup }
+          );
+          sent.push({ userId: u.telegramId, msgId: msg.message_id });
+        } catch(e) {}
+      }));
+      // Small gap between chunks to respect Telegram rate limit
+      if (i + CHUNK < users.length) await new Promise(r => setTimeout(r, 100));
+    }
+
+    searchNotifications.set(gameId, sent);
+    console.log(`📢 Notified ${sent.length}/${users.length} users for game ${gameId}`);
+  } catch(e){ console.error('notify err:', e.stack || e); }
 }
 
 async function deleteSearchMsgs(gameId) {
