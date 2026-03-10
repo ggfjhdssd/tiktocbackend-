@@ -35,7 +35,7 @@ const ENTRY_FEE = 1000;
 const WIN_PRIZE = 1600;
 const DRAW_REFUND = 500;
 const TURN_SECONDS = 10;
-const SEARCH_TIMEOUT_S = 30;
+const SEARCH_TIMEOUT_S = 60;
 
 // ===== MongoDB =====
 let isConnected = false;
@@ -132,6 +132,15 @@ const searchTimeouts = new Map(); // store timeouts for search expiry notificati
 
 // Store fake game IDs generated for fake search notifications
 const fakeGameIds = new Set();
+
+// ===== Concurrency & Spam Protection =====
+// FIX 1: Lock set – prevents double-click race on findGame
+const processingUsers = new Set();
+// FIX 5: Cooldown maps – prevent spam (ms timestamps)
+const moveCooldowns    = new Map();  // userId → lastMove timestamp
+const findGameCooldowns = new Map(); // userId → lastFindGame timestamp
+const MOVE_COOLDOWN_MS     = 300;   // 300ms between moves
+const FINDGAME_COOLDOWN_MS = 2000;  // 2s between findGame attempts
 
 // ===== Helpers =====
 function genRefCode(id) {
@@ -255,6 +264,7 @@ async function startSabotageAIGame(socket, userId, gameId, userName) {
     board: Array(5).fill(null).map(()=>Array(5).fill('')),
     currentTurn: firstTurn, status:'active', isAIGame:true,
     aiType: AI_TYPE_SABOTAGE,
+    startedAt: Date.now(), lastMoveAt: Date.now(), // FIX 2: zombie tracking
     playerNames: { [userId]: userName, [AI_ID]: aiName }
   };
   activeGames.set(gameId, gameState);
@@ -327,6 +337,9 @@ async function endGameAI(gameId, winner, reason='normal') {
   if (humanIdForCleanup) {
     const t = searchTimeouts.get(humanIdForCleanup);
     if (t) { clearTimeout(t); searchTimeouts.delete(humanIdForCleanup); }
+    moveCooldowns.delete(humanIdForCleanup);
+    findGameCooldowns.delete(humanIdForCleanup);
+    processingUsers.delete(humanIdForCleanup);
   }
 }
 
@@ -712,6 +725,36 @@ async function sendFakeSearchNotification() {
   setTimeout(() => deleteSearchMsgs(fakeGameId), SEARCH_TIMEOUT_S * 1000);
 }
 
+// ===== FIX 3: Zombie Game Cleanup (every 5 minutes) =====
+// If a game has been active but had no moves for >2 minutes, auto-end it
+setInterval(async () => {
+  const now = Date.now();
+  const IDLE_LIMIT_MS = 2 * 60 * 1000; // 2 minutes
+  for (const [gameId, game] of activeGames.entries()) {
+    if (game.status !== 'active') continue;
+    const lastMove = game.lastMoveAt || game.startedAt || 0;
+    if (now - lastMove < IDLE_LIMIT_MS) continue;
+    console.log(`🧹 Zombie game cleanup: ${gameId} (idle ${Math.round((now-lastMove)/1000)}s)`);
+    try {
+      if (game.isAIGame) {
+        await endGameAI(gameId, -1, 'timeout');
+      } else {
+        // Refund both players
+        for (const pid of (game.players || [])) {
+          await User.findOneAndUpdate({telegramId:pid},{$inc:{balance:ENTRY_FEE}}).catch(()=>{});
+        }
+        io.to(gameId).emit('gameOver', { winner: -1, reason: 'timeout', board: game.board });
+        activeGames.delete(gameId);
+        clearTurnTimer(gameId);
+        for (const pid of (game.players || [])) {
+          const t = searchTimeouts.get(pid); if (t) { clearTimeout(t); searchTimeouts.delete(pid); }
+        }
+        setTimeout(()=>deleteSearchMsgs(gameId),500);
+      }
+    } catch(e) { console.error('Zombie cleanup err:', e); }
+  }
+}, 5 * 60 * 1000);
+
 // Start fake notification interval with random delay between 2 and 5 minutes
 function scheduleNextFakeNotification() {
   const min = 2 * 60 * 1000;  // 2 minutes
@@ -761,6 +804,9 @@ async function endGame(gameId, winner, reason='normal') {
   for (const pid of (game.players || [])) {
     const t = searchTimeouts.get(pid);
     if (t) { clearTimeout(t); searchTimeouts.delete(pid); }
+    moveCooldowns.delete(pid);
+    findGameCooldowns.delete(pid);
+    processingUsers.delete(pid);
   }
   setTimeout(()=>deleteSearchMsgs(gameId),500);
 }
@@ -773,30 +819,45 @@ io.on('connection', (socket) => {
   socket.on('findGame', async ({userId}) => {
     if (!userId) return socket.emit('error',{msg:'userId မပါ'});
     myUserId = parseInt(userId);
-    userSockets.set(myUserId, socket.id);
 
-    const existEntry = [...activeGames.entries()].find(([,g])=>g.players.includes(myUserId));
-    if (existEntry) {
-      const [gid, game] = existEntry;
-      myGameId = gid;
-      socket.join(gid);
-      socket.emit('gameResumed',{
-        gameId:gid, board:game.board,
-        mySymbol: game.symbols.get ? game.symbols.get(String(myUserId)) : game.symbols[myUserId],
-        currentTurn:game.currentTurn, players:game.playerNames
-      });
-      return;
+    // FIX 5: findGame cooldown – prevent spam
+    const lastFG = findGameCooldowns.get(myUserId) || 0;
+    if (Date.now() - lastFG < FINDGAME_COOLDOWN_MS) {
+      return socket.emit('error',{msg:'နည်းနည်းစောင့်ပါ...'});
     }
+    findGameCooldowns.set(myUserId, Date.now());
 
-    const user = await User.findOne({telegramId:myUserId}).lean();
-    if (!user) return socket.emit('error',{msg:'User မတွေ့ပါ'});
-    if (user.isBanned===true) return socket.emit('error',{msg:'ကောင်ပိတ်ဆို့ထားသည်'});
-    if (user.balance < ENTRY_FEE) {
-      return socket.emit('insufficientBalance',{balance:user.balance,required:ENTRY_FEE});
+    // FIX 1: processingUsers lock – prevent double-click race
+    if (processingUsers.has(myUserId)) {
+      return socket.emit('error',{msg:'ရှာဖွေနေဆဲ ဖြစ်သည်'});
     }
+    processingUsers.add(myUserId);
 
-    // Update lastActive timestamp
-    User.findOneAndUpdate({telegramId:myUserId},{lastActive:new Date()}).catch(()=>{});
+    try {
+      userSockets.set(myUserId, socket.id);
+
+      const existEntry = [...activeGames.entries()].find(([,g])=>g.players.includes(myUserId));
+      if (existEntry) {
+        const [gid, game] = existEntry;
+        myGameId = gid;
+        socket.join(gid);
+        socket.emit('gameResumed',{
+          gameId:gid, board:game.board,
+          mySymbol: game.symbols.get ? game.symbols.get(String(myUserId)) : game.symbols[myUserId],
+          currentTurn:game.currentTurn, players:game.playerNames
+        });
+        return;
+      }
+
+      const user = await User.findOne({telegramId:myUserId}).lean();
+      if (!user) return socket.emit('error',{msg:'User မတွေ့ပါ'});
+      if (user.isBanned===true) return socket.emit('error',{msg:'ကောင်ပိတ်ဆို့ထားသည်'});
+      if (user.balance < ENTRY_FEE) {
+        return socket.emit('insufficientBalance',{balance:user.balance,required:ENTRY_FEE});
+      }
+
+      // Update lastActive timestamp
+      User.findOneAndUpdate({telegramId:myUserId},{lastActive:new Date()}).catch(()=>{});
 
     const allBotMode = await getSetting('allBotMode', false);
     const joinGameId = socket.handshake.query?.join;
@@ -888,6 +949,7 @@ io.on('connection', (socket) => {
         gameId:myGameId, players:[waiter.userId,myUserId], symbols,
         board: Array(5).fill(null).map(()=>Array(5).fill('')),
         currentTurn:firstTurn, status:'active',
+        startedAt: Date.now(), lastMoveAt: Date.now(), // FIX 2: zombie tracking
         playerNames: {
           [waiter.userId]: waiterUser?.firstName||waiterUser?.username||`User${waiter.userId}`,
           [myUserId]: joinerUser?.firstName||joinerUser?.username||`User${myUserId}`
@@ -925,6 +987,13 @@ io.on('connection', (socket) => {
       }, SEARCH_TIMEOUT_S * 1000);
       searchTimeouts.set(myUserId, timeout);
     }
+    } catch(e) {
+      console.error('findGame err:', e);
+      socket.emit('error',{msg:'ဆာဗာ error ဖြစ်သည်'});
+    } finally {
+      // FIX 1: Always release the processing lock
+      processingUsers.delete(myUserId);
+    }
   });
 
   socket.on('cancelSearch', async ({userId}) => {
@@ -942,47 +1011,60 @@ io.on('connection', (socket) => {
   });
 
   socket.on('makeMove', async ({gameId,row,col}) => {
-    const game = activeGames.get(gameId);
-    if (!game||game.status!=='active') return;
-    // FIX 3: Block user move while AI is thinking (race condition guard)
-    if (game.isAIGame && game.currentTurn === AI_ID) {
-      return socket.emit('error',{msg:'AI စဉ်းစားနေဆဲ ဖြစ်သည်'});
-    }
-    if (game.currentTurn!==myUserId) return socket.emit('error',{msg:'သင့်လှည့် မဟုတ်ပါ'});
-    if (row<0||row>4||col<0||col>4) return socket.emit('error',{msg:'Invalid move'});
-    if (game.board[row][col]!=='') return socket.emit('error',{msg:'ထိုနေရာ ယူပြီးသား'});
+    // FIX 5: Move cooldown – prevent spam clicking
+    const lastMove = moveCooldowns.get(myUserId) || 0;
+    if (Date.now() - lastMove < MOVE_COOLDOWN_MS) return;
+    moveCooldowns.set(myUserId, Date.now());
 
-    const sym = game.symbols[myUserId];
-
-    // Sabotage check – if user is about to win, trigger one of the three tactics
-    if (game.aiType === AI_TYPE_SABOTAGE && checkWinAfterMove(game.board, row, col, sym)) {
-      clearTurnTimer(gameId);
-      await handleSabotage(game, myUserId, {row, col});
-      return;
-    }
-
-    // Normal move processing
-    clearTurnTimer(gameId);
-    game.board[row][col] = sym;
-
-    io.to(gameId).emit('moveMade',{row,col,symbol:sym,playerId:myUserId,board:game.board});
-
-    if (checkWin(game.board,sym)) {
-      if (game.isAIGame) await endGameAI(gameId,myUserId,'win');
-      else await endGame(gameId,myUserId,'win');
-    } else if (boardFull(game.board)) {
-      if (game.isAIGame) await endGameAI(gameId,-1,'draw');
-      else await endGame(gameId,-1,'draw');
-    } else {
-      const next = game.players.find(p=>p!==myUserId);
-      game.currentTurn = next;
-      io.to(gameId).emit('turnChanged',{currentTurn:next});
-      if (next === AI_ID) {
-        scheduleSabotageAIMove(gameId);
-      } else {
-        const t = setTimeout(()=>handleTurnTimeout(gameId,next),TURN_SECONDS*1000+1500);
-        gameTurnTimeouts.set(gameId,t);
+    try {
+      const game = activeGames.get(gameId);
+      if (!game||game.status!=='active') return;
+      // Block user move while AI is thinking (race condition guard)
+      if (game.isAIGame && game.currentTurn === AI_ID) {
+        return socket.emit('error',{msg:'AI စဉ်းစားနေဆဲ ဖြစ်သည်'});
       }
+      if (game.currentTurn!==myUserId) return socket.emit('error',{msg:'သင့်လှည့် မဟုတ်ပါ'});
+      if (row<0||row>4||col<0||col>4) return socket.emit('error',{msg:'Invalid move'});
+      if (game.board[row][col]!=='') return socket.emit('error',{msg:'ထိုနေရာ ယူပြီးသား'});
+
+      const sym = game.symbols[myUserId];
+
+      // Sabotage check – if user is about to win, trigger one of the three tactics
+      // ⚠️  DO NOT MODIFY handleSabotage – intentional game mechanic
+      if (game.aiType === AI_TYPE_SABOTAGE && checkWinAfterMove(game.board, row, col, sym)) {
+        clearTurnTimer(gameId);
+        await handleSabotage(game, myUserId, {row, col});
+        return;
+      }
+
+      // Normal move processing
+      clearTurnTimer(gameId);
+      game.board[row][col] = sym;
+      // FIX 2/3: Track last move time for zombie cleanup
+      game.lastMoveAt = Date.now();
+
+      io.to(gameId).emit('moveMade',{row,col,symbol:sym,playerId:myUserId,board:game.board});
+
+      if (checkWin(game.board,sym)) {
+        if (game.isAIGame) await endGameAI(gameId,myUserId,'win');
+        else await endGame(gameId,myUserId,'win');
+      } else if (boardFull(game.board)) {
+        if (game.isAIGame) await endGameAI(gameId,-1,'draw');
+        else await endGame(gameId,-1,'draw');
+      } else {
+        const next = game.players.find(p=>p!==myUserId);
+        game.currentTurn = next;
+        io.to(gameId).emit('turnChanged',{currentTurn:next});
+        if (next === AI_ID) {
+          scheduleSabotageAIMove(gameId);
+        } else {
+          const t = setTimeout(()=>handleTurnTimeout(gameId,next),TURN_SECONDS*1000+1500);
+          gameTurnTimeouts.set(gameId,t);
+        }
+      }
+    } catch(e) {
+      console.error('makeMove err:', e);
+      socket.emit('error',{msg:'Move error ဖြစ်သည်'});
     }
   });
 
@@ -1027,7 +1109,13 @@ io.on('connection', (socket) => {
         }
       }
     }
-    if (myUserId) userSockets.delete(myUserId);
+    if (myUserId) {
+      userSockets.delete(myUserId);
+      // FIX 4: Full cleanup on disconnect
+      processingUsers.delete(myUserId);
+      moveCooldowns.delete(myUserId);
+      findGameCooldowns.delete(myUserId);
+    }
   });
 
   async function handleTurnTimeout(gameId, playerId) {
