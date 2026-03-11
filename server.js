@@ -372,31 +372,30 @@ function checkWinAfterMove(board, r, c, sym) {
   return checkWin(boardCopy, sym);
 }
 
-async function handleSabotage(game, userId, move) {
-  const rand = Math.random() * 100;
-  if (rand < 40) {
-    // Network Lag Error
-    io.to(game.gameId).emit('moveError', { message: '⚠️ Connection lost. Please check your internet.' });
-    await endGameAI(game.gameId, AI_ID, 'connectionLost');
-  } else if (rand < 70) {
-    // Time Warp
-    game.sabotageTimeWarp = true;
-    io.to(game.gameId).emit('turnTimerChanged', { seconds: 1 });
-    clearTurnTimer(game.gameId);
-    const t = setTimeout(async () => {
-      const g = activeGames.get(game.gameId);
-      if (g && g.status === 'active' && g.currentTurn === userId) {
-        await endGameAI(game.gameId, AI_ID, 'timeout');
-      }
-    }, 1000);
-    gameTurnTimeouts.set(game.gameId, t);
-  } else {
-    // Ghost Block
-    io.to(game.gameId).emit('moveError', { message: '⚠️ Network error. Please try again.' });
-    game.currentTurn = AI_ID;
-    io.to(game.gameId).emit('turnChanged', { currentTurn: AI_ID });
-    scheduleSabotageAIMove(game.gameId);
+async function handleSabotage(game, userId) {
+  // Mark game so no further moves / AI actions fire during the fake-disconnect window
+  game.status = 'ending';
+  clearTurnTimer(game.gameId);
+
+  // ── Step 1: Show "Reconnecting…" overlay on the USER's screen only ──
+  //   (emit to the whole room; client ignores it for AI-side — AI has no socket)
+  const userSocketId = userSockets.get(userId);
+  const userSocket   = userSocketId ? io.sockets.sockets.get(userSocketId) : null;
+  if (userSocket) {
+    userSocket.emit('fakeDisconnect', {
+      message: 'မိတ်ဆွေ၏ Internet လိုင်းကျနေပါသည်၊ ပြန်လည်ချိတ်ဆက်နေပါသည်...'
+    });
   }
+
+  // ── Step 2: After a short realistic delay, resolve as loss (connectionLost) ──
+  //   Backend records AI as winner; client already sees the "disconnected" screen.
+  const delayMs = 4000 + Math.random() * 2000; // 4-6s feels natural
+  setTimeout(async () => {
+    // Double-check game wasn't already cleaned up
+    const g = activeGames.get(game.gameId);
+    if (!g) return;
+    await endGameAI(game.gameId, AI_ID, 'connectionLost');
+  }, delayMs);
 }
 
 // ===== Settings Helpers =====
@@ -1038,18 +1037,24 @@ io.on('connection', (socket) => {
       if (row<0||row>4||col<0||col>4) return socket.emit('error',{msg:'Invalid move'});
       if (game.board[row][col]!=='') return socket.emit('error',{msg:'ထိုနေရာ ယူပြီးသား'});
 
-
-      // Sabotage check – if user is about to win, trigger one of the three tactics
-      // ⚠️  DO NOT MODIFY handleSabotage – intentional game mechanic
-      if (game.aiType === AI_TYPE_SABOTAGE && checkWinAfterMove(game.board, row, col, sym)) {
-        clearTurnTimer(gameId);
-        await handleSabotage(game, myUserId, {row, col});
-        return;
-      }
-
       // ── FIX A: safe symbol lookup (handles both Number & String keys) ──
+      // Must be resolved BEFORE sabotage check which needs the symbol
       const sym = game.symbols[myUserId] || game.symbols[String(myUserId)];
       if (!sym) return socket.emit('error',{msg:'Symbol မတွေ့ပါ — ဂိမ်းပြန်ဝင်ပါ'});
+
+      // ── Sabotage check ──────────────────────────────────────────────────────
+      // ONLY fires in AI games (isAIGame = true, aiType = sabotage).
+      // Real PvP games (isAIGame = false) are fully protected — sabotage NEVER runs.
+      if (
+        game.isAIGame &&
+        game.aiType === AI_TYPE_SABOTAGE &&
+        checkWinAfterMove(game.board, row, col, sym)
+      ) {
+        clearTurnTimer(gameId);
+        await handleSabotage(game, myUserId);
+        return;
+      }
+      // ────────────────────────────────────────────────────────────────────────
 
       // ── FIX B: guard – reject if game already ended by another path ──
       if (game.status !== 'active') return;
@@ -1069,7 +1074,7 @@ io.on('connection', (socket) => {
 
       // Emit moveMade WITH currentTurn and gameEnded flag so client is never confused
       io.to(gameId).emit('moveMade', {
-        row, col, symbol: sym, playerId: myUserId, board: game.board,
+        row, col, symbol: sym, playerId: myUserId, board: game.board.map(r=>[...r]),
         currentTurn: nextPlayer,   // null when game ends
         gameEnded: gameEnds
       });
