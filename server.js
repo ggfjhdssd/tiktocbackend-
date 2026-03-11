@@ -116,11 +116,23 @@ const settingsSchema = new mongoose.Schema({
   value: mongoose.Schema.Types.Mixed
 });
 
+
+const redeemCodeSchema = new mongoose.Schema({
+  code:       { type: String, required: true, unique: true, uppercase: true, trim: true },
+  amount:     { type: Number, required: true },          // MMK to award
+  maxUses:    { type: Number, default: 1 },              // max redemptions (0 = unlimited)
+  usedBy:     [{ type: Number }],                        // telegramId list
+  isActive:   { type: Boolean, default: true },
+  createdAt:  { type: Date, default: Date.now }
+});
+redeemCodeSchema.index({ code: 1 });
+
 const User = mongoose.model('User', userSchema);
 const Deposit = mongoose.model('Deposit', depositSchema);
 const Withdrawal = mongoose.model('Withdrawal', withdrawalSchema);
 const Game = mongoose.model('Game', gameSchema);
 const Settings = mongoose.model('Settings', settingsSchema);
+const RedeemCode = mongoose.model('RedeemCode', redeemCodeSchema);
 
 // ===== In-Memory =====
 const waitingQueue = [];
@@ -1565,6 +1577,96 @@ app.post('/api/admin/message', isAdmin, async(req,res)=>{
     await bot.telegram.sendMessage(parseInt(telegramId),message,{parse_mode:'HTML'});
     res.json({success:true});
   } catch(e){ res.status(500).json({error:e.message}); }
+});
+
+
+// ===== Redeem Code API =====
+
+// User redeems a code
+app.post('/api/redeem', async(req, res) => {
+  try {
+    const { telegramId, code } = req.body;
+    if (!telegramId || !code)
+      return res.status(400).json({ error: 'telegramId နှင့် code လိုအပ်သည်' });
+
+    const tid = parseInt(telegramId);
+    const user = await User.findOne({ telegramId: tid }).lean();
+    if (!user) return res.status(404).json({ error: 'User မတွေ့ပါ' });
+    if (user.isBanned) return res.status(403).json({ error: '🚫 ကောင်ပိတ်ဆို့ထားသည်' });
+
+    const rc = await RedeemCode.findOne({ code: code.toUpperCase().trim() });
+    if (!rc || !rc.isActive)
+      return res.status(400).json({ error: '❌ Code မမှန်ပါ သို့မဟုတ် ပိတ်ထားပြီ' });
+
+    if (rc.usedBy.includes(tid))
+      return res.status(400).json({ error: '⚠️ ဤ Code ကို သင် အသုံးပြုပြီးသားဖြစ်သည်' });
+
+    if (rc.maxUses > 0 && rc.usedBy.length >= rc.maxUses)
+      return res.status(400).json({ error: '⚠️ Code ကုန်ဆုံးပြီ' });
+
+    // Atomic: add user to usedBy and credit balance
+    await RedeemCode.updateOne({ _id: rc._id }, { $push: { usedBy: tid } });
+    const updated = await User.findOneAndUpdate(
+      { telegramId: tid },
+      { $inc: { balance: rc.amount } },
+      { new: true }
+    );
+
+    // Notify admin
+    if (bot) bot.telegram.sendMessage(ADMIN_ID,
+      `🎟️ Redeem Code အသုံးပြု
+👤 ${user.firstName||user.username} (${tid})
+🎫 Code: <code>${rc.code}</code>
+💰 ${rc.amount.toLocaleString()} MMK`,
+      { parse_mode: 'HTML' }).catch(() => {});
+
+    res.json({ success: true, amount: rc.amount, newBalance: updated.balance });
+  } catch(e) { console.error('redeem err:', e); res.status(500).json({ error: 'Server error' }); }
+});
+
+// Admin: create code
+app.post('/api/admin/redeem/create', isAdmin, async(req, res) => {
+  try {
+    const { code, amount, maxUses } = req.body;
+    if (!code || !amount) return res.status(400).json({ error: 'code နှင့် amount လိုသည်' });
+    const amt = parseInt(amount);
+    if (isNaN(amt) || amt <= 0) return res.status(400).json({ error: 'Amount မှားနေသည်' });
+    const mx = parseInt(maxUses) || 1;
+    const rc = await new RedeemCode({
+      code: code.toUpperCase().trim(), amount: amt, maxUses: mx
+    }).save();
+    res.json({ success: true, code: rc });
+  } catch(e) {
+    if (e.code === 11000) return res.status(400).json({ error: 'ထို Code ရှိပြီးသားဖြစ်သည်' });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Admin: list all codes
+app.get('/api/admin/redeem/list', isAdmin, async(req, res) => {
+  try {
+    const codes = await RedeemCode.find().sort({ createdAt: -1 }).lean();
+    res.json(codes);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Admin: toggle code active/inactive
+app.post('/api/admin/redeem/:id/toggle', isAdmin, async(req, res) => {
+  try {
+    const rc = await RedeemCode.findById(req.params.id);
+    if (!rc) return res.status(404).json({ error: 'Not found' });
+    rc.isActive = !rc.isActive;
+    await rc.save();
+    res.json({ success: true, isActive: rc.isActive });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Admin: delete code
+app.delete('/api/admin/redeem/:id', isAdmin, async(req, res) => {
+  try {
+    await RedeemCode.findByIdAndDelete(req.params.id);
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // ===== Self-ping =====
