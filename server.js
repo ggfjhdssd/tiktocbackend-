@@ -31,9 +31,9 @@ const ADMIN_ID = process.env.ADMIN_ID ? parseInt(process.env.ADMIN_ID) : null;
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://tictokfrontend.vercel.app';
 const BACKEND_URL = process.env.BACKEND_URL || 'https://tiktocbackend.onrender.com';
 const BOT_USERNAME = process.env.BOT_USERNAME || 'tictoe1_bot';
-const ENTRY_FEE = 1000;
-const WIN_PRIZE = 1600;
-const DRAW_REFUND = 500;
+const ENTRY_FEE = 500;
+const WIN_PRIZE = 800;
+const DRAW_REFUND = 250;
 const TURN_SECONDS = 10;
 const SEARCH_TIMEOUT_S = 60;
 
@@ -691,12 +691,8 @@ async function sendFakeSearchNotification() {
   const fakeEnabled = await getSetting('fakeNotifications', false);
   if (!fakeEnabled) return;
 
-  // Also check if bot mode is active (global or any user with botMode)
-  const allBotMode = await getSetting('allBotMode', false);
-  if (!allBotMode) {
-    const anyBotUser = await User.exists({ botMode: true });
-    if (!anyBotUser) return;
-  }
+  // FIX: Fake notifications are purely cosmetic — always send regardless of bot mode
+  // (Bot matching only happens when allBotMode is ALSO on — see findGame handler)
 
   const fakeGameId = genGameId();
   fakeGameIds.add(fakeGameId);
@@ -734,7 +730,7 @@ async function sendFakeSearchNotification() {
   console.log(`📢 Fake search notification sent (${sent.length} users) with gameId ${fakeGameId}`);
 
   // Auto-delete after 30 seconds if not clicked
-  setTimeout(() => deleteSearchMsgs(fakeGameId), SEARCH_TIMEOUT_S * 1000);
+  setTimeout(() => deleteSearchMsgs(fakeGameId), 3600000); // 1 hour
 }
 
 // ===== FIX 3: Zombie Game Cleanup (every 5 minutes) =====
@@ -767,17 +763,18 @@ setInterval(async () => {
   }
 }, 5 * 60 * 1000);
 
-// Start fake notification interval with random delay between 2 and 5 minutes
-function scheduleNextFakeNotification() {
-  const min = 2 * 60 * 1000;  // 2 minutes
-  const max = 5 * 60 * 1000;  // 5 minutes
-  const delay = Math.floor(Math.random() * (max - min + 1)) + min;
-  setTimeout(async () => {
+// Dynamic fake notification interval (admin-configurable, default 3 minutes)
+let fakeNotifTimer = null;
+async function scheduleFakeNotification() {
+  if (fakeNotifTimer) { clearTimeout(fakeNotifTimer); fakeNotifTimer = null; }
+  const intervalMins = await getSetting('fakeNotifInterval', 3); // default 3 min
+  const delay = Math.max(1, Number(intervalMins)) * 60 * 1000;
+  fakeNotifTimer = setTimeout(async () => {
     await sendFakeSearchNotification();
-    scheduleNextFakeNotification();
+    scheduleFakeNotification(); // reschedule after each fire
   }, delay);
 }
-scheduleNextFakeNotification();
+scheduleFakeNotification();
 
 // ===== Game Logic =====
 function clearTurnTimer(gameId) {
@@ -1212,8 +1209,8 @@ app.post('/api/deposit', async(req,res)=>{
     const {telegramId,kpayName,transactionId,amount}=req.body;
     if (!telegramId||!kpayName||!transactionId||!amount)
       return res.status(400).json({error:'ကွင်းလပ်များ ဖြည့်ပေးပါ'});
-    if (parseInt(amount)<1000)
-      return res.status(400).json({error:'အနည်းဆုံး 1,000 MMK'});
+    if (parseInt(amount)<500)
+      return res.status(400).json({error:'အနည်းဆုံး 500 MMK'});
     const u=await User.findOne({telegramId:parseInt(telegramId)}).lean();
     if (!u) return res.status(404).json({error:'User not found'});
     if (u.isBanned) return res.status(403).json({error:'ကောင်ပိတ်ဆို့ထားသည်'});
@@ -1233,8 +1230,8 @@ app.post('/api/withdraw', async(req,res)=>{
     if (!telegramId||!kpayName||!kpayNumber||!amount)
       return res.status(400).json({error:'ကွင်းလပ်များ ဖြည့်ပေးပါ'});
     const amt=parseInt(amount);
-    if (isNaN(amt)||amt<3000)
-      return res.status(400).json({error:'အနည်းဆုံး 3,000 MMK'});
+    if (isNaN(amt)||amt<2500)
+      return res.status(400).json({error:'အနည်းဆုံး 2,500 MMK'});
     const tid=parseInt(telegramId);
 
     const chk=await User.findOne({telegramId:tid}).select('balance isBanned firstName username').lean();
@@ -1360,7 +1357,8 @@ app.get('/api/admin/settings', isAdmin, async(_,res)=>{
   const maint = await getSetting('maintenance',false);
   const allBotMode = await getSetting('allBotMode', false);
   const fakeNotifications = await getSetting('fakeNotifications', false);
-  res.json({maintenance:maint, allBotMode, fakeNotifications, entryFee:ENTRY_FEE, winPrize:WIN_PRIZE, drawRefund:DRAW_REFUND, turnSeconds:TURN_SECONDS});
+  const fakeNotifInterval = await getSetting('fakeNotifInterval', 3);
+  res.json({maintenance:maint, allBotMode, fakeNotifications, fakeNotifInterval, entryFee:ENTRY_FEE, winPrize:WIN_PRIZE, drawRefund:DRAW_REFUND, turnSeconds:TURN_SECONDS});
 });
 
 app.post('/api/admin/maintenance', isAdmin, async(req,res)=>{
@@ -1387,6 +1385,15 @@ app.get('/api/admin/fakenotifications', isAdmin, async(req,res)=>{
 app.post('/api/admin/fakenotifications', isAdmin, async(req,res)=>{
   await setSetting('fakeNotifications', !!req.body.enabled);
   res.json({success:true, fakeNotifications: !!req.body.enabled});
+});
+
+// Set fake notification interval (minutes)
+app.post('/api/admin/fakenotifinterval', isAdmin, async(req,res)=>{
+  const mins = Math.max(1, Number(req.body.interval) || 3);
+  await setSetting('fakeNotifInterval', mins);
+  // Restart scheduler with new interval
+  scheduleFakeNotification();
+  res.json({success:true, fakeNotifInterval: mins});
 });
 
 app.get('/api/admin/deposits', isAdmin, async(req,res)=>{
