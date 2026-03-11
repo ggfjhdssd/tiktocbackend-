@@ -322,7 +322,7 @@ function scheduleSabotageAIMove(gameId) {
 
 async function endGameAI(gameId, winner, reason='normal') {
   const game = activeGames.get(gameId);
-  if (!game || game.status !== 'active') return;
+  if (!game || (game.status !== 'active' && game.status !== 'ending')) return;
   clearTurnTimer(gameId);
   game.status = 'completed';
   const humanId = game.players.find(p => p !== AI_ID);
@@ -784,29 +784,31 @@ function clearTurnTimer(gameId) {
 
 async function endGame(gameId, winner, reason='normal') {
   const game = activeGames.get(gameId);
-  if (!game || game.status !== 'active') return;
+  // Accept 'active' OR our pre-marked 'ending' state; reject anything else
+  if (!game || (game.status !== 'active' && game.status !== 'ending')) return;
   clearTurnTimer(gameId);
   game.status = 'completed';
+  const winnerId = winner === -1 ? -1 : Number(winner); // ── FIX: explicit cast
 
   try {
-    if (winner === -1) {
+    if (winnerId === -1) {
       for (const pid of game.players) {
         await User.findOneAndUpdate({telegramId:pid},{$inc:{balance:DRAW_REFUND,totalGames:1}});
       }
-    } else if (winner) {
-      const loser = game.players.find(p=>p!==winner);
-      await User.findOneAndUpdate({telegramId:winner},{$inc:{balance:WIN_PRIZE,wins:1,totalGames:1}});
+    } else if (winnerId) {
+      const loser = game.players.find(p => Number(p) !== winnerId);
+      await User.findOneAndUpdate({telegramId:winnerId},{$inc:{balance:WIN_PRIZE,wins:1,totalGames:1}});
       if (loser) await User.findOneAndUpdate({telegramId:loser},{$inc:{losses:1,totalGames:1}});
     }
     await Game.findOneAndUpdate({gameId},{
-      winner, status:'completed', board:game.board,
+      winner: winnerId, status:'completed', board:game.board,
       playerNames: game.playerNames,
-      winnerName: winner===-1 ? 'draw' : (game.playerNames?.[winner] || String(winner)),
+      winnerName: winnerId===-1 ? 'draw' : (game.playerNames?.[winnerId] || String(winnerId)),
       isAIGame: !!game.isAIGame
     },{upsert:true});
   } catch(e){ console.error('endGame err:', e.stack || e); }
 
-  io.to(gameId).emit('gameOver',{winner,reason,board:game.board});
+  io.to(gameId).emit('gameOver',{winner:winnerId,reason,board:game.board});
   // FIX 4: Full memory cleanup
   activeGames.delete(gameId);
   clearTurnTimer(gameId);
@@ -1036,7 +1038,6 @@ io.on('connection', (socket) => {
       if (row<0||row>4||col<0||col>4) return socket.emit('error',{msg:'Invalid move'});
       if (game.board[row][col]!=='') return socket.emit('error',{msg:'ထိုနေရာ ယူပြီးသား'});
 
-      const sym = game.symbols[myUserId];
 
       // Sabotage check – if user is about to win, trigger one of the three tactics
       // ⚠️  DO NOT MODIFY handleSabotage – intentional game mechanic
@@ -1046,29 +1047,51 @@ io.on('connection', (socket) => {
         return;
       }
 
+      // ── FIX A: safe symbol lookup (handles both Number & String keys) ──
+      const sym = game.symbols[myUserId] || game.symbols[String(myUserId)];
+      if (!sym) return socket.emit('error',{msg:'Symbol မတွေ့ပါ — ဂိမ်းပြန်ဝင်ပါ'});
+
+      // ── FIX B: guard – reject if game already ended by another path ──
+      if (game.status !== 'active') return;
+
       // Normal move processing
       clearTurnTimer(gameId);
       game.board[row][col] = sym;
-      // FIX 2/3: Track last move time for zombie cleanup
       game.lastMoveAt = Date.now();
 
-      io.to(gameId).emit('moveMade',{row,col,symbol:sym,playerId:myUserId,board:game.board});
+      // ── FIX C: detect outcome BEFORE emitting so client gets correct flags ──
+      const didWin  = checkWin(game.board, sym);
+      const isDraw  = !didWin && boardFull(game.board);
+      const gameEnds = didWin || isDraw;
 
-      if (checkWin(game.board,sym)) {
-        if (game.isAIGame) await endGameAI(gameId,myUserId,'win');
-        else await endGame(gameId,myUserId,'win');
-      } else if (boardFull(game.board)) {
-        if (game.isAIGame) await endGameAI(gameId,-1,'draw');
-        else await endGame(gameId,-1,'draw');
+      // ── FIX D: determine next turn only when game continues ──
+      const nextPlayer = gameEnds ? null : game.players.find(p => p !== myUserId);
+
+      // Emit moveMade WITH currentTurn and gameEnded flag so client is never confused
+      io.to(gameId).emit('moveMade', {
+        row, col, symbol: sym, playerId: myUserId, board: game.board,
+        currentTurn: nextPlayer,   // null when game ends
+        gameEnded: gameEnds
+      });
+
+      if (didWin) {
+        // ── FIX E: mark status SYNCHRONOUSLY before any await ──
+        game.status = 'ending';
+        if (game.isAIGame) await endGameAI(gameId, myUserId, 'win');
+        else                await endGame(gameId, myUserId, 'win');
+      } else if (isDraw) {
+        game.status = 'ending';
+        if (game.isAIGame) await endGameAI(gameId, -1, 'draw');
+        else                await endGame(gameId, -1, 'draw');
       } else {
-        const next = game.players.find(p=>p!==myUserId);
-        game.currentTurn = next;
-        io.to(gameId).emit('turnChanged',{currentTurn:next});
-        if (next === AI_ID) {
+        // ── FIX F: update currentTurn, then emit turnChanged, THEN set timer ──
+        game.currentTurn = nextPlayer;
+        io.to(gameId).emit('turnChanged', {currentTurn: nextPlayer});
+        if (nextPlayer === AI_ID) {
           scheduleSabotageAIMove(gameId);
         } else {
-          const t = setTimeout(()=>handleTurnTimeout(gameId,next),TURN_SECONDS*1000+1500);
-          gameTurnTimeouts.set(gameId,t);
+          const t = setTimeout(() => handleTurnTimeout(gameId, nextPlayer), TURN_SECONDS*1000+1500);
+          gameTurnTimeouts.set(gameId, t);
         }
       }
     } catch(e) {
@@ -1125,9 +1148,11 @@ io.on('connection', (socket) => {
 
   async function handleTurnTimeout(gameId, playerId) {
     const game = activeGames.get(gameId);
-    if (!game||game.status!=='active'||game.currentTurn!==playerId) return;
-    const opp = game.players.find(p=>p!==playerId);
-    await endGame(gameId,opp,'timeout');
+    // Extra guard: reject if game ended OR if turn already advanced (stale timer)
+    if (!game || game.status !== 'active' || Number(game.currentTurn) !== Number(playerId)) return;
+    const opp = game.players.find(p => Number(p) !== Number(playerId));
+    if (!opp) return; // safety: no opponent found
+    await endGame(gameId, opp, 'timeout');
   }
 });
 
