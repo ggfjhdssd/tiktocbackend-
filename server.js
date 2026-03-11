@@ -67,6 +67,7 @@ const userSchema = new mongoose.Schema({
   wins: { type: Number, default: 0 },
   losses: { type: Number, default: 0 },
   isBanned: { type: Boolean, default: false },
+  role: { type: String, enum: ['user','agent'], default: 'user' },
   botMode: { type: Boolean, default: false },
   lastActive: { type: Date, default: Date.now },
   createdAt: { type: Date, default: Date.now }
@@ -127,12 +128,50 @@ const redeemCodeSchema = new mongoose.Schema({
 });
 redeemCodeSchema.index({ code: 1 });
 
+// ===== Agent Schema =====
+const agentSchema = new mongoose.Schema({
+  telegramId:    { type: Number, required: true, unique: true },
+  referralCode:  { type: String },           // same as User.referralCode
+  milestones: {
+    // box1..box10: { current, claimed, lastReset(for loop) }
+    1:  { current:{type:Number,default:0}, claimed:{type:Boolean,default:false} },
+    2:  { current:{type:Number,default:0}, claimed:{type:Boolean,default:false} },
+    3:  { current:{type:Number,default:0}, claimed:{type:Boolean,default:false} },
+    4:  { current:{type:Number,default:0}, claimed:{type:Boolean,default:false} },
+    5:  { current:{type:Number,default:0}, claimed:{type:Boolean,default:false} },
+    6:  { current:{type:Number,default:0}, claimed:{type:Boolean,default:false} },
+    7:  { current:{type:Number,default:0}, claimed:{type:Boolean,default:false} },
+    8:  { current:{type:Number,default:0}, claimed:{type:Boolean,default:false} },
+    9:  { current:{type:Number,default:0}, claimed:{type:Boolean,default:false} },
+    10: { current:{type:Number,default:0}, claimed:{type:Boolean,default:false} }
+  },
+  totalEarned:   { type: Number, default: 0 },
+  completedBoxes:{ type: Number, default: 0 },
+  isActive:      { type: Boolean, default: true },
+  createdAt:     { type: Date, default: Date.now }
+});
+agentSchema.index({ telegramId: 1 });
+
+const BOX_CONFIG = [
+  { box:1, people:5,   perPerson:1000,  bonus:500      },
+  { box:2, people:10,  perPerson:2000,  bonus:2000     },
+  { box:3, people:30,  perPerson:3000,  bonus:10000    },
+  { box:4, people:50,  perPerson:5000,  bonus:30000    },
+  { box:5, people:70,  perPerson:10000, bonus:80000    },  // corrected from screenshot
+  { box:6, people:100, perPerson:20000, bonus:300000   },
+  { box:7, people:150, perPerson:30000, bonus:800000   },
+  { box:8, people:200, perPerson:50000, bonus:2000000  },
+  { box:9, people:70,  perPerson:70000, bonus:1000000  },
+  { box:10,people:10,  perPerson:2000,  bonus:2000,    loop:true }
+];
+
 const User = mongoose.model('User', userSchema);
 const Deposit = mongoose.model('Deposit', depositSchema);
 const Withdrawal = mongoose.model('Withdrawal', withdrawalSchema);
 const Game = mongoose.model('Game', gameSchema);
 const Settings = mongoose.model('Settings', settingsSchema);
 const RedeemCode = mongoose.model('RedeemCode', redeemCodeSchema);
+const Agent = mongoose.model('Agent', agentSchema);
 
 // ===== In-Memory =====
 const waitingQueue = [];
@@ -585,6 +624,27 @@ if (BOT_TOKEN) {
         }
       ).catch(()=>{});
     } catch(e) { console.error('admin cmd err:', e.stack || e); }
+  });
+
+  bot.command('agent', async (ctx) => {
+    try {
+      const id = ctx.from.id;
+      const user = await User.findOne({ telegramId: id }).lean();
+      if (!user) { await ctx.reply('ဦးစွာ /start နှိပ်ပါ').catch(()=>{}); return; }
+      if (user.role !== 'agent') {
+        await ctx.reply('🚫 သင်သည် အေးဂျင့် မဟုတ်သေးပါ\n\nAdmin ကို ဆက်သွယ်ပြီး Agent ခွင့်ပြုချက် ရယူပါ').catch(()=>{});
+        return;
+      }
+      await ctx.reply(
+        `🎯 <b>Agent Panel</b>\n\nမင်္ဂလာပါ Agent!\n\nသင်၏ Agent Dashboard သို့ ဝင်ရောက်ပါ ↓`,
+        {
+          parse_mode: 'HTML',
+          ...Markup.inlineKeyboard([
+            [Markup.button.webApp('🎯 Agent Panel သို့ဝင်ရန်', `${FRONTEND_URL}/agent.html`)]
+          ])
+        }
+      ).catch(()=>{});
+    } catch(e) { console.error('agent cmd err:', e.stack || e); }
   });
 
   bot.catch((err, ctx) => {
@@ -1179,6 +1239,37 @@ app.post('/api/admin/verify', async(req,res)=>{
   } catch(e){ res.status(500).json({error:'Server error'}); }
 });
 
+// ===== Agent Milestone Helper =====
+async function updateAgentMilestone(agentTelegramId, depositAmount) {
+  try {
+    const agentUser = await User.findOne({ telegramId: agentTelegramId, role: 'agent' }).lean();
+    if (!agentUser) return;
+
+    let agent = await Agent.findOne({ telegramId: agentTelegramId });
+    if (!agent) {
+      agent = new Agent({ telegramId: agentTelegramId, referralCode: agentUser.referralCode });
+      await agent.save();
+    }
+
+    // Update each box's milestone progress based on deposit amount
+    for (const cfg of BOX_CONFIG) {
+      const ms = agent.milestones[cfg.box];
+      if (!ms || ms.claimed) continue;
+      // For loop box (10), reset if claimed
+      if (cfg.loop) {
+        // Already reset logic is in claim
+      }
+      // Check if this deposit meets the per-person threshold for this box
+      if (depositAmount >= cfg.perPerson) {
+        if (ms.current < cfg.people) {
+          agent.milestones[cfg.box].current = ms.current + 1;
+        }
+      }
+    }
+    await agent.save();
+  } catch(e) { console.error('agentMilestone err:', e); }
+}
+
 // ===== Routes =====
 app.get('/', (_,res)=>res.json({ok:true}));
 app.get('/health', (_,res)=>res.json({
@@ -1453,6 +1544,8 @@ app.post('/api/admin/deposits/:id/confirm', isAdmin, async(req,res)=>{
           `🎉 သင့် referral မှ ငွေဖြည့်သောကြောင့် <b>100 MMK</b> ရရှိပါပြီ!`,
           {parse_mode:'HTML'}).catch(()=>{});
       }
+      // Agent milestone update
+      await updateAgentMilestone(user.referredBy, dep.amount);
     }
     if (bot) bot.telegram.sendMessage(dep.userId,
       `✅ ငွေ ${dep.amount.toLocaleString()} MMK သွင်းမှု အတည်ပြုပြီး!\n\nသင့်လက်ကျန်ငွေ ပေါင်းထည့်ပြီး 🎉`,
@@ -1616,6 +1709,250 @@ app.post('/api/admin/message', isAdmin, async(req,res)=>{
   } catch(e){ res.status(500).json({error:e.message}); }
 });
 
+
+// ===== Agent API =====
+
+// Middleware: verify agent
+async function isAgent(req, res, next) {
+  const tid = parseInt(req.headers['x-telegram-id'] || req.query.telegramId);
+  if (!tid) return res.status(401).json({ error: 'Telegram ID မပါ' });
+  const user = await User.findOne({ telegramId: tid, role: 'agent' }).lean();
+  if (!user) return res.status(403).json({ error: 'Agent မဟုတ်သေးပါ' });
+  req.agentUser = user;
+  next();
+}
+
+// Get agent panel data
+app.get('/api/agent/panel', isAgent, async (req, res) => {
+  try {
+    const user = req.agentUser;
+    let agent = await Agent.findOne({ telegramId: user.telegramId });
+    if (!agent) {
+      agent = new Agent({ telegramId: user.telegramId, referralCode: user.referralCode });
+      await agent.save();
+    }
+    const totalReferrals = await User.countDocuments({ referredBy: user.telegramId });
+    res.json({
+      telegramId: user.telegramId,
+      firstName: user.firstName,
+      username: user.username,
+      balance: user.balance,
+      referralCode: user.referralCode,
+      botUsername: BOT_USERNAME,
+      milestones: agent.milestones,
+      totalEarned: agent.totalEarned,
+      completedBoxes: agent.completedBoxes,
+      totalReferrals
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Get agent referrals
+app.get('/api/agent/referrals', isAgent, async (req, res) => {
+  try {
+    const referrals = await User.find({ referredBy: req.agentUser.telegramId })
+      .select('firstName username balance createdAt')
+      .sort({ createdAt: -1 })
+      .lean();
+    const list = referrals.map(u => ({
+      name: u.firstName || u.username || `User${u.telegramId}`,
+      username: u.username || '',
+      balance: u.balance || 0,
+      joinedAt: u.createdAt
+    }));
+    res.json({ total: list.length, referrals: list });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Claim box bonus
+app.post('/api/agent/claim-box', isAgent, async (req, res) => {
+  try {
+    const { box } = req.body;
+    const boxNum = parseInt(box);
+    if (!boxNum || boxNum < 1 || boxNum > 10) return res.status(400).json({ error: 'Box နံပါတ် မမှန်ပါ' });
+
+    const cfg = BOX_CONFIG.find(b => b.box === boxNum);
+    if (!cfg) return res.status(400).json({ error: 'Box မတွေ့ပါ' });
+
+    const user = req.agentUser;
+    let agent = await Agent.findOne({ telegramId: user.telegramId });
+    if (!agent) return res.status(404).json({ error: 'Agent Data မတွေ့ပါ' });
+
+    const ms = agent.milestones[boxNum];
+    if (!ms) return res.status(400).json({ error: 'Milestone မတွေ့ပါ' });
+
+    // Check unlock condition for box 10
+    if (boxNum === 10) {
+      const box2 = agent.milestones[2];
+      if (!box2?.claimed) return res.status(400).json({ error: 'Box 2 အောင်မြင်မှ Box 10 ယူနိုင်မည်' });
+    }
+
+    if (ms.current < cfg.people) {
+      return res.status(400).json({ error: `လူဦးရေ မပြည့်သေးပါ (${ms.current}/${cfg.people})` });
+    }
+
+    if (!cfg.loop && ms.claimed) {
+      return res.status(400).json({ error: 'ဆုကြေး ယူပြီးသည်' });
+    }
+
+    // Give bonus
+    const updated = await User.findOneAndUpdate(
+      { telegramId: user.telegramId },
+      { $inc: { balance: cfg.bonus } },
+      { new: true }
+    );
+
+    // Update milestone
+    if (cfg.loop) {
+      // Reset for next cycle
+      agent.milestones[boxNum].current = 0;
+      agent.milestones[boxNum].claimed = false;
+    } else {
+      agent.milestones[boxNum].claimed = true;
+      agent.completedBoxes = (agent.completedBoxes || 0) + 1;
+    }
+    agent.totalEarned = (agent.totalEarned || 0) + cfg.bonus;
+    await agent.save();
+
+    // Notify agent via bot
+    if (bot) {
+      bot.telegram.sendMessage(user.telegramId,
+        `🎉 <b>Box ${boxNum} ဆုကြေး ရပြီ!</b>\n\n💰 +${cfg.bonus.toLocaleString()} MMK\n🏦 လက်ကျန်: ${updated.balance.toLocaleString()} MMK`,
+        { parse_mode: 'HTML' }
+      ).catch(() => {});
+    }
+
+    res.json({ success: true, bonus: cfg.bonus, newBalance: updated.balance });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Admin: Make user an Agent
+app.post('/api/admin/users/:tid/make-agent', isAdmin, async (req, res) => {
+  try {
+    const tid = parseInt(req.params.tid);
+    const { isAgent: makeAgent } = req.body;
+    const newRole = makeAgent ? 'agent' : 'user';
+    const u = await User.findOneAndUpdate(
+      { telegramId: tid },
+      { role: newRole },
+      { new: true }
+    );
+    if (!u) return res.status(404).json({ error: 'User မတွေ့ပါ' });
+
+    if (makeAgent) {
+      // Create agent record if not exists
+      await Agent.findOneAndUpdate(
+        { telegramId: tid },
+        { $setOnInsert: { telegramId: tid, referralCode: u.referralCode } },
+        { upsert: true }
+      );
+      if (bot) {
+        bot.telegram.sendMessage(tid,
+          `🎯 <b>Agent အဖြစ် ခွင့်ပြုပြီ!</b>\n\n🎉 မင်္ဂလာပါ Agent!\n\nBot တွင် <code>/agent</code> ရိုက်ပြီး Agent Panel ကို ဝင်ရောက်ပါ`,
+          { parse_mode: 'HTML' }
+        ).catch(() => {});
+      }
+    } else {
+      if (bot) {
+        bot.telegram.sendMessage(tid,
+          `ℹ️ သင်၏ Agent အဆင့်ကို ဖယ်ရှားပြီးပါပြီ`,
+          { parse_mode: 'HTML' }
+        ).catch(() => {});
+      }
+    }
+
+    res.json({ success: true, role: newRole });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Admin: List all agents
+app.get('/api/admin/agents', isAdmin, async (req, res) => {
+  try {
+    const { page = 1, search = '' } = req.query;
+    const limit = 20;
+    const q = { role: 'agent' };
+    if (search) {
+      const tid = isNaN(search) ? null : parseInt(search);
+      q.$or = [
+        ...(tid ? [{ telegramId: tid }] : []),
+        { username: { $regex: search, $options: 'i' } },
+        { firstName: { $regex: search, $options: 'i' } }
+      ];
+    }
+    const agents = await User.find(q).sort({ createdAt: -1 }).skip((page-1)*limit).limit(limit).lean();
+    const total = await User.countDocuments(q);
+
+    const enriched = await Promise.all(agents.map(async u => {
+      const agentDoc = await Agent.findOne({ telegramId: u.telegramId }).lean();
+      const totalReferrals = await User.countDocuments({ referredBy: u.telegramId });
+      return {
+        ...u,
+        agentData: agentDoc,
+        totalReferrals
+      };
+    }));
+
+    res.json({ agents: enriched, total, pages: Math.ceil(total / limit) });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Admin: Get single agent details
+app.get('/api/admin/agents/:tid', isAdmin, async (req, res) => {
+  try {
+    const tid = parseInt(req.params.tid);
+    const user = await User.findOne({ telegramId: tid, role: 'agent' }).lean();
+    if (!user) return res.status(404).json({ error: 'Agent မတွေ့ပါ' });
+    const agentDoc = await Agent.findOne({ telegramId: tid }).lean();
+    const referrals = await User.find({ referredBy: tid })
+      .select('firstName username balance createdAt').sort({ createdAt: -1 }).lean();
+    const totalReferrals = referrals.length;
+    res.json({ user, agentData: agentDoc, referrals, totalReferrals });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Admin: Reset agent milestone
+app.post('/api/admin/agents/:tid/reset-box', isAdmin, async (req, res) => {
+  try {
+    const tid = parseInt(req.params.tid);
+    const { box } = req.body;
+    const boxNum = parseInt(box);
+    const agent = await Agent.findOne({ telegramId: tid });
+    if (!agent) return res.status(404).json({ error: 'Agent Data မတွေ့ပါ' });
+    agent.milestones[boxNum].current = 0;
+    agent.milestones[boxNum].claimed = false;
+    await agent.save();
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Admin: Manually award agent box bonus
+app.post('/api/admin/agents/:tid/award-box', isAdmin, async (req, res) => {
+  try {
+    const tid = parseInt(req.params.tid);
+    const { box } = req.body;
+    const boxNum = parseInt(box);
+    const cfg = BOX_CONFIG.find(b => b.box === boxNum);
+    if (!cfg) return res.status(400).json({ error: 'Box မတွေ့ပါ' });
+
+    const u = await User.findOneAndUpdate({ telegramId: tid }, { $inc: { balance: cfg.bonus } }, { new: true });
+    if (!u) return res.status(404).json({ error: 'User မတွေ့ပါ' });
+
+    const agent = await Agent.findOne({ telegramId: tid });
+    if (agent) {
+      if (!cfg.loop) agent.milestones[boxNum].claimed = true;
+      agent.totalEarned = (agent.totalEarned || 0) + cfg.bonus;
+      await agent.save();
+    }
+
+    if (bot) {
+      bot.telegram.sendMessage(tid,
+        `🎁 <b>Admin မှ Box ${boxNum} ဆုကြေး ပေးအပ်</b>\n💰 +${cfg.bonus.toLocaleString()} MMK`,
+        { parse_mode: 'HTML' }
+      ).catch(() => {});
+    }
+    res.json({ success: true, bonus: cfg.bonus, newBalance: u.balance });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
 
 // ===== Redeem Code API =====
 
