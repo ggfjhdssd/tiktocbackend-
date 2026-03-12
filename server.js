@@ -1175,24 +1175,39 @@ io.on('connection', (socket) => {
       const timeout = searchTimeouts.get(userId);
       if (timeout) { clearTimeout(timeout); searchTimeouts.delete(userId); }
     }
-    // ✅ CHANGED: Instant loss on disconnect — no 30s reconnect window
-    if (myGameId && activeGames.has(myGameId)) {
-      const game = activeGames.get(myGameId);
-      if (game?.status === 'active') {
-        if (game.isAIGame) {
-          await endGameAI(myGameId, AI_ID, 'disconnect');
-        } else {
-          const opp = game.players.find(p => p !== myUserId);
-          if (opp) await endGame(myGameId, opp, 'disconnect');
-        }
-      }
+
+    // ── Disconnect Loss: 5 second delay to handle brief network drops ──
+    // လိုင်းခဏကျပြီး ပြန်ချိတ်တဲ့ case မှာ ချက်ချင်း loss မပေးဖို့ delay ထည့်သည်
+    const disconnectedUserId = myUserId;
+    const disconnectedGameId = myGameId;
+
+    if (disconnectedUserId) {
+      userSockets.delete(disconnectedUserId);
+      processingUsers.delete(disconnectedUserId);
+      moveCooldowns.delete(disconnectedUserId);
+      findGameCooldowns.delete(disconnectedUserId);
     }
-    if (myUserId) {
-      userSockets.delete(myUserId);
-      // FIX 4: Full cleanup on disconnect
-      processingUsers.delete(myUserId);
-      moveCooldowns.delete(myUserId);
-      findGameCooldowns.delete(myUserId);
+
+    if (disconnectedGameId && activeGames.has(disconnectedGameId)) {
+      setTimeout(async () => {
+        // 5 စက္ကန့် နောက်မှ check — ပြန်ချိတ်ဆက်ပြီ ဖြစ်ရင် userSockets မှာ ပြန်ရှိနေမည်
+        const reconnected = disconnectedUserId && userSockets.has(disconnectedUserId);
+        if (reconnected) {
+          console.log(`[Disconnect] User ${disconnectedUserId} reconnected — no loss applied`);
+          return;
+        }
+
+        const game = activeGames.get(disconnectedGameId);
+        if (!game || game.status !== 'active') return;
+
+        console.log(`[Disconnect] User ${disconnectedUserId} confirmed disconnected — ending game ${disconnectedGameId}`);
+        if (game.isAIGame) {
+          await endGameAI(disconnectedGameId, AI_ID, 'disconnect');
+        } else {
+          const opp = game.players.find(p => Number(p) !== Number(disconnectedUserId));
+          if (opp) await endGame(disconnectedGameId, opp, 'disconnect');
+        }
+      }, 5000); // 5 seconds grace period
     }
   });
 
@@ -1213,11 +1228,28 @@ io.on('connection', (socket) => {
 
   async function handleTurnTimeout(gameId, playerId) {
     const game = activeGames.get(gameId);
-    // Extra guard: reject if game ended OR if turn already advanced (stale timer)
-    if (!game || game.status !== 'active' || Number(game.currentTurn) !== Number(playerId)) return;
-    const opp = game.players.find(p => Number(p) !== Number(playerId));
-    if (!opp) return; // safety: no opponent found
-    await endGame(gameId, opp, 'timeout');
+    // Guard: game မရှိရင် / active မဟုတ်ရင် / stale timer ဖြစ်ရင် skip
+    if (!game || game.status !== 'active') return;
+
+    const timedOutId = Number(playerId);
+    const currentTurnId = Number(game.currentTurn);
+
+    // အချိန်ကုန်သူ (timedOutId) သာ ရှုံးရမည် — တစ်ဖက်လူ မဟုတ်
+    // currentTurn === timedOut player မဟုတ်ရင် ဒီ timer က stale ဖြစ်ပြီ — skip
+    if (currentTurnId !== timedOutId) {
+      console.log(`[Timeout] Stale timer ignored: currentTurn=${currentTurnId}, timedOut=${timedOutId}`);
+      return;
+    }
+
+    // တစ်ဖက်လူ (opponent) ကို ရှာပြီး အနိုင်ပေး
+    const winner = game.players.find(p => Number(p) !== timedOutId);
+    if (!winner) {
+      console.log(`[Timeout] No opponent found for game ${gameId}, cannot determine winner`);
+      return;
+    }
+
+    console.log(`[Timeout] gameId=${gameId} | timedOut=${timedOutId} loses | winner=${winner}`);
+    await endGame(gameId, winner, 'timeout');
   }
 });
 
