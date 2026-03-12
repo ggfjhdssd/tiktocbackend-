@@ -1575,8 +1575,8 @@ app.get('/api/admin/deposits', isAdmin, async(req,res)=>{
 app.post('/api/admin/deposits/:id/confirm', isAdmin, async(req,res)=>{
   try {
     const dep=await Deposit.findById(req.params.id);
-    if (!dep) return res.status(404).json({error:'Not found'});
-    if (dep.status!=='pending') return res.status(400).json({error:'Already processed'});
+    if (!dep) return res.status(404).json({error:'Deposit မတွေ့ပါ'});
+    if (dep.status!=='pending') return res.status(400).json({error:'ဤ Deposit ကို ပြင်ဆင်ပြီးသားဖြစ်သည်'});
     dep.status='confirmed'; dep.processedAt=new Date(); await dep.save();
     await User.findOneAndUpdate({telegramId:dep.userId},{$inc:{balance:dep.amount}});
     const user=await User.findOne({telegramId:dep.userId}).lean();
@@ -1605,7 +1605,7 @@ app.post('/api/admin/deposits/:id/reject', isAdmin, async(req,res)=>{
     const dep=await Deposit.findByIdAndUpdate(req.params.id,
       {status:'rejected', processedAt:new Date(), expireAt:TTL_72H},
       {new:true});
-    if (!dep) return res.status(404).json({error:'Not found'});
+    if (!dep) return res.status(404).json({error:'Deposit မတွေ့ပါ'});
     const reasonText = reason ? `\nအကြောင်းပြချက်: ${reason}` : '';
     if (bot) bot.telegram.sendMessage(dep.userId,
       `❌ ငွေ ${dep.amount.toLocaleString()} ကျပ် သွင်းမှု ပယ်ချပြီ\nTxn: ${dep.transactionId}${reasonText}`).catch(()=>{});
@@ -1627,8 +1627,8 @@ app.get('/api/admin/withdrawals', isAdmin, async(req,res)=>{
 app.post('/api/admin/withdrawals/:id/confirm', isAdmin, async(req,res)=>{
   try {
     const wd=await Withdrawal.findById(req.params.id);
-    if (!wd) return res.status(404).json({error:'Not found'});
-    if (wd.status!=='pending') return res.status(400).json({error:'Already processed'});
+    if (!wd) return res.status(404).json({error:'Withdrawal မတွေ့ပါ'});
+    if (wd.status!=='pending') return res.status(400).json({error:'ဤ Withdrawal ကို ပြင်ဆင်ပြီးသားဖြစ်သည်'});
     wd.status='confirmed'; wd.processedAt=new Date(); await wd.save();
     if (bot) bot.telegram.sendMessage(wd.userId,
       `✅ ငွေ ${wd.amount.toLocaleString()} ကျပ် ထုတ်မှု အတည်ပြုပြီး!\n${wd.paymentMethod === 'wave' ? '🌊 Wave Pay' : '📱 KPay'}: ${wd.kpayNumber} 🎉`).catch(()=>{});
@@ -1639,8 +1639,8 @@ app.post('/api/admin/withdrawals/:id/confirm', isAdmin, async(req,res)=>{
 app.post('/api/admin/withdrawals/:id/reject', isAdmin, async(req,res)=>{
   try {
     const wd=await Withdrawal.findById(req.params.id);
-    if (!wd) return res.status(404).json({error:'Not found'});
-    if (wd.status!=='pending') return res.status(400).json({error:'Already processed'});
+    if (!wd) return res.status(404).json({error:'Withdrawal မတွေ့ပါ'});
+    if (wd.status!=='pending') return res.status(400).json({error:'ဤ Withdrawal ကို ပြင်ဆင်ပြီးသားဖြစ်သည်'});
     const TTL_72H = new Date(Date.now() + 72 * 60 * 60 * 1000);
     wd.status='rejected'; wd.processedAt=new Date(); wd.expireAt=TTL_72H;
     await wd.save();
