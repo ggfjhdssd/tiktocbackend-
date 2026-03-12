@@ -28,6 +28,8 @@ const io = new Server(server, {
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_ID = process.env.ADMIN_ID ? parseInt(process.env.ADMIN_ID) : null;
+// ⚠️  IMPORTANT: Set FRONTEND_URL environment variable in Render to your actual Vercel URL
+// e.g. https://tictoefrontend.vercel.app  (check your Vercel project name exactly)
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://tictokfrontend.vercel.app';
 const BACKEND_URL = process.env.BACKEND_URL || 'https://tiktocbackend.onrender.com';
 const BOT_USERNAME = process.env.BOT_USERNAME || 'tictoe1_bot';
@@ -1714,12 +1716,29 @@ app.post('/api/admin/message', isAdmin, async(req,res)=>{
 
 // Middleware: verify agent
 async function isAgent(req, res, next) {
-  const tid = parseInt(req.headers['x-telegram-id'] || req.query.telegramId);
-  if (!tid) return res.status(401).json({ error: 'Telegram ID မပါ' });
-  const user = await User.findOne({ telegramId: tid, role: 'agent' }).lean();
-  if (!user) return res.status(403).json({ error: 'Agent မဟုတ်သေးပါ' });
-  req.agentUser = user;
-  next();
+  try {
+    // Accept telegram ID from header, query, or body
+    const tid = parseInt(
+      req.headers['x-telegram-id'] ||
+      req.query.telegramId ||
+      req.body?.telegramId
+    );
+    if (!tid || isNaN(tid)) {
+      return res.status(401).json({ error: 'Telegram ID မပါ — Bot မှ Panel ကိုဖွင့်ပါ' });
+    }
+    const user = await User.findOne({ telegramId: tid, role: 'agent' }).lean();
+    if (!user) {
+      return res.status(403).json({ error: 'Agent မဟုတ်သေးပါ — Admin မှ Agent ခွင့်ပြုချက် ရယူပါ' });
+    }
+    if (user.isBanned) {
+      return res.status(403).json({ error: 'ကောင်ပိတ်ဆို့ထားပါသည်' });
+    }
+    req.agentUser = user;
+    next();
+  } catch(e) {
+    console.error('isAgent middleware err:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
 }
 
 // Get agent panel data
