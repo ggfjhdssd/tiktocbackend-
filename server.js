@@ -1375,7 +1375,7 @@ app.post('/api/deposit', async(req,res)=>{
     const methodLabel = method === 'wave' ? '🌊 Wave Pay' : '📱 KPay';
     const dep=await new Deposit({userId:u.telegramId,kpayName,transactionId,amount:parseInt(amount),paymentMethod:method}).save();
     if (bot) bot.telegram.sendMessage(ADMIN_ID,
-      `💰 *ငွေသွင်း တောင်းဆိုမှု*\n👤 ${u.firstName||u.username} (${u.telegramId})\n💵 ${parseInt(amount).toLocaleString()} MMK\n${methodLabel} ဖြင့် သွင်းထားသည်\n📝 ${kpayName}\n🔢 \`${transactionId}\``,
+      `💰 *ငွေသွင်း တောင်းဆိုမှု*\n👤 ${u.firstName||u.username} (${u.telegramId})\n💵 ${parseInt(amount).toLocaleString()} ကျပ်\n${methodLabel} ဖြင့် သွင်းထားသည်\n📝 ${kpayName}\n🔢 \`${transactionId}\``,
       {parse_mode:'Markdown'}).catch(()=>{});
     res.json({success:true,depositId:dep._id});
   } catch(e){ console.error(e); res.status(500).json({error:'Server error'}); }
@@ -1420,7 +1420,7 @@ app.post('/api/withdraw', async(req,res)=>{
     }
 
     if (bot) bot.telegram.sendMessage(ADMIN_ID,
-      `💸 *ငွေထုတ် တောင်းဆိုမှု*\n👤 ${u.firstName||u.username} (${u.telegramId})\n💵 ${amt.toLocaleString()} MMK\n${methodLabel} ဖြင့် ထုတ်မည်\n📝 ${kpayName}\n📱 ${kpayNumber}\n🏦 ကျန်: ${u.balance.toLocaleString()} MMK`,
+      `💸 *ငွေထုတ် တောင်းဆိုမှု*\n👤 ${u.firstName||u.username} (${u.telegramId})\n💵 ${amt.toLocaleString()} ကျပ်\n${methodLabel} ဖြင့် ထုတ်မည်\n📝 ${kpayName}\n📱 ${kpayNumber}\n🏦 ကျန်: ${u.balance.toLocaleString()} ကျပ်`,
       {parse_mode:'Markdown'}).catch(()=>{});
     res.json({success:true,withdrawalId:wd._id,newBalance:u.balance});
   } catch(e){ console.error('withdraw err:',e); res.status(500).json({error:'Server error'}); }
@@ -1587,7 +1587,7 @@ app.post('/api/admin/deposits/:id/confirm', isAdmin, async(req,res)=>{
       await updateAgentMilestone(user.referredBy, dep.amount);
     }
     if (bot) bot.telegram.sendMessage(dep.userId,
-      `✅ ငွေ ${dep.amount.toLocaleString()} MMK သွင်းမှု အတည်ပြုပြီး!\n\nသင့်လက်ကျန်ငွေ ပေါင်းထည့်ပြီး 🎉`,
+      `✅ ငွေ ${dep.amount.toLocaleString()} ကျပ် သွင်းမှု အတည်ပြုပြီး!\n\nသင့်လက်ကျန်ငွေ ပေါင်းထည့်ပြီး 🎉`,
       Markup.inlineKeyboard([[Markup.button.webApp('🎮 ကစားမည်', FRONTEND_URL)]]) ).catch(()=>{});
     res.json({success:true});
   } catch(e){ res.status(500).json({error:e.message}); }
@@ -1600,7 +1600,7 @@ app.post('/api/admin/deposits/:id/reject', isAdmin, async(req,res)=>{
     if (!dep) return res.status(404).json({error:'Not found'});
     const reasonText = reason ? `\nအကြောင်းပြချက်: ${reason}` : '';
     if (bot) bot.telegram.sendMessage(dep.userId,
-      `❌ ငွေ ${dep.amount.toLocaleString()} MMK သွင်းမှု ပယ်ချပြီ\nTxn: ${dep.transactionId}${reasonText}`).catch(()=>{});
+      `❌ ငွေ ${dep.amount.toLocaleString()} ကျပ် သွင်းမှု ပယ်ချပြီ\nTxn: ${dep.transactionId}${reasonText}`).catch(()=>{});
     res.json({success:true});
   } catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -1623,7 +1623,7 @@ app.post('/api/admin/withdrawals/:id/confirm', isAdmin, async(req,res)=>{
     if (wd.status!=='pending') return res.status(400).json({error:'Already processed'});
     wd.status='confirmed'; wd.processedAt=new Date(); await wd.save();
     if (bot) bot.telegram.sendMessage(wd.userId,
-      `✅ ငွေ ${wd.amount.toLocaleString()} MMK ထုတ်မှု အတည်ပြုပြီး!\n${wd.paymentMethod === 'wave' ? '🌊 Wave Pay' : '📱 KPay'}: ${wd.kpayNumber} 🎉`).catch(()=>{});
+      `✅ ငွေ ${wd.amount.toLocaleString()} ကျပ် ထုတ်မှု အတည်ပြုပြီး!\n${wd.paymentMethod === 'wave' ? '🌊 Wave Pay' : '📱 KPay'}: ${wd.kpayNumber} 🎉`).catch(()=>{});
     res.json({success:true});
   } catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -1636,7 +1636,7 @@ app.post('/api/admin/withdrawals/:id/reject', isAdmin, async(req,res)=>{
     wd.status='rejected'; wd.processedAt=new Date(); await wd.save();
     await User.findOneAndUpdate({telegramId:wd.userId},{$inc:{balance:wd.amount}});
     if (bot) bot.telegram.sendMessage(wd.userId,
-      `❌ ငွေ ${wd.amount.toLocaleString()} MMK ထုတ်မှု ပယ်ချပြီး ငွေပြန်အမ်းပြီ`).catch(()=>{});
+      `❌ ငွေ ${wd.amount.toLocaleString()} ကျပ် ထုတ်မှု ပယ်ချပြီး ငွေပြန်အမ်းပြီ`).catch(()=>{});
     res.json({success:true});
   } catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -1689,7 +1689,7 @@ app.post('/api/admin/users/:tid/balance', isAdmin, async(req,res)=>{
     if (bot) {
       const sign=amount>0?'+':'';
       bot.telegram.sendMessage(u.telegramId,
-        `💰 Admin မှ ${sign}${parseInt(amount).toLocaleString()} MMK\n${reason?`မှတ်ချက်: ${reason}`:''}\nလက်ကျန်: ${u.balance.toLocaleString()} MMK`).catch(()=>{});
+        `💰 Admin မှ ${sign}${parseInt(amount).toLocaleString()} ကျပ်\n${reason?`မှတ်ချက်: ${reason}`:''}\nလက်ကျန်: ${u.balance.toLocaleString()} ကျပ်`).catch(()=>{});
     }
     res.json({success:true,newBalance:u.balance});
   } catch(e){ res.status(500).json({error:e.message}); }
@@ -1856,12 +1856,108 @@ app.post('/api/agent/claim-box', isAgent, async (req, res) => {
     // Notify agent via bot
     if (bot) {
       bot.telegram.sendMessage(user.telegramId,
-        `🎉 <b>Box ${boxNum} ဆုကြေး ရပြီ!</b>\n\n💰 +${cfg.bonus.toLocaleString()} MMK\n🏦 လက်ကျန်: ${updated.balance.toLocaleString()} MMK`,
+        `🎉 <b>Box ${boxNum} ဆုကြေး ရပြီ!</b>\n\n💰 +${cfg.bonus.toLocaleString()} ကျပ်\n🏦 လက်ကျန်: ${updated.balance.toLocaleString()} ကျပ်`,
         { parse_mode: 'HTML' }
       ).catch(() => {});
     }
 
     res.json({ success: true, bonus: cfg.bonus, newBalance: updated.balance });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ===== Agent Deposit Control =====
+
+// Get pending deposits for agent's referral users
+app.get('/api/agent/deposits', isAgent, async (req, res) => {
+  try {
+    const agentId = req.agentUser.telegramId;
+    // Find all users referred by this agent
+    const referredUsers = await User.find({ referredBy: agentId }).select('telegramId firstName username').lean();
+    if (!referredUsers.length) return res.json([]);
+
+    const referredIds = referredUsers.map(u => u.telegramId);
+    const userMap = {};
+    referredUsers.forEach(u => { userMap[u.telegramId] = u.firstName || u.username || `User${u.telegramId}`; });
+
+    const status = req.query.status || 'pending';
+    const deps = await Deposit.find({ userId: { $in: referredIds }, status })
+      .sort({ createdAt: -1 }).limit(50).lean();
+
+    const out = deps.map(d => ({
+      ...d,
+      userName: userMap[d.userId] || String(d.userId)
+    }));
+    res.json(out);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Agent confirms a deposit for their referral user
+app.post('/api/agent/deposits/:id/confirm', isAgent, async (req, res) => {
+  try {
+    const agentId = req.agentUser.telegramId;
+    const dep = await Deposit.findById(req.params.id);
+    if (!dep) return res.status(404).json({ error: 'မတွေ့ပါ' });
+    if (dep.status !== 'pending') return res.status(400).json({ error: 'ပြင်ဆင်ပြီးသားဖြစ်သည်' });
+
+    // Verify this deposit belongs to one of the agent's referrals
+    const user = await User.findOne({ telegramId: dep.userId }).lean();
+    if (!user || user.referredBy !== agentId) {
+      return res.status(403).json({ error: 'ဤ User သည် သင့် Referral မဟုတ်ပါ' });
+    }
+
+    dep.status = 'confirmed';
+    dep.processedAt = new Date();
+    await dep.save();
+
+    // Credit user balance
+    await User.findOneAndUpdate({ telegramId: dep.userId }, { $inc: { balance: dep.amount } });
+
+    // First deposit referral bonus (100 MMK to agent)
+    const prevDeps = await Deposit.countDocuments({ userId: dep.userId, status: 'confirmed', _id: { $ne: dep._id } });
+    if (prevDeps === 0) {
+      await User.findOneAndUpdate({ telegramId: agentId }, { $inc: { balance: 100 } });
+      if (bot) bot.telegram.sendMessage(agentId,
+        `🎉 Referral မှ ပထမဆုံး ငွေဖြည့်သောကြောင့် <b>၁၀၀ ကျပ်</b> ရရှိပါပြီ!`,
+        { parse_mode: 'HTML' }).catch(() => {});
+    }
+
+    // Agent milestone update
+    await updateAgentMilestone(agentId, dep.amount);
+
+    // Notify user via bot
+    const methodLabel = dep.paymentMethod === 'wave' ? '🌊 Wave Pay' : '📱 KPay';
+    if (bot) bot.telegram.sendMessage(dep.userId,
+      `✅ ငွေ ${dep.amount.toLocaleString()} ကျပ် သွင်းမှု အတည်ပြုပြီး!\n${methodLabel}\n\nသင့်လက်ကျန်ငွေ ပေါင်းထည့်ပြီး 🎉`,
+      Markup.inlineKeyboard([[Markup.button.webApp('🎮 ကစားမည်', FRONTEND_URL)]]) ).catch(() => {});
+
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Agent rejects a deposit for their referral user
+app.post('/api/agent/deposits/:id/reject', isAgent, async (req, res) => {
+  try {
+    const agentId = req.agentUser.telegramId;
+    const { reason } = req.body;
+    const dep = await Deposit.findById(req.params.id);
+    if (!dep) return res.status(404).json({ error: 'မတွေ့ပါ' });
+    if (dep.status !== 'pending') return res.status(400).json({ error: 'ပြင်ဆင်ပြီးသားဖြစ်သည်' });
+
+    // Verify this deposit belongs to one of the agent's referrals
+    const user = await User.findOne({ telegramId: dep.userId }).lean();
+    if (!user || user.referredBy !== agentId) {
+      return res.status(403).json({ error: 'ဤ User သည် သင့် Referral မဟုတ်ပါ' });
+    }
+
+    dep.status = 'rejected';
+    dep.processedAt = new Date();
+    await dep.save();
+
+    const reasonText = reason ? `\nအကြောင်းပြချက်: ${reason}` : '';
+    if (bot) bot.telegram.sendMessage(dep.userId,
+      `❌ ငွေ ${dep.amount.toLocaleString()} ကျပ် သွင်းမှု ပယ်ချပြီ\nTxn: ${dep.transactionId}${reasonText}`).catch(() => {});
+
+    res.json({ success: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
