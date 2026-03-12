@@ -80,6 +80,7 @@ const depositSchema = new mongoose.Schema({
   kpayName: String,
   transactionId: { type: String, required: true, unique: true },
   amount: { type: Number, required: true },
+  paymentMethod: { type: String, enum: ['kpay','wave'], default: 'kpay' },
   status: { type: String, enum: ['pending','confirmed','rejected'], default: 'pending' },
   createdAt: { type: Date, default: Date.now },
   processedAt: Date
@@ -92,6 +93,7 @@ const withdrawalSchema = new mongoose.Schema({
   kpayName: String,
   kpayNumber: String,
   amount: { type: Number, required: true },
+  paymentMethod: { type: String, enum: ['kpay','wave'], default: 'kpay' },
   status: { type: String, enum: ['pending','confirmed','rejected'], default: 'pending' },
   createdAt: { type: Date, default: Date.now },
   processedAt: Date
@@ -1359,7 +1361,7 @@ app.get('/api/user/:id', async(req,res)=>{
 
 app.post('/api/deposit', async(req,res)=>{
   try {
-    const {telegramId,kpayName,transactionId,amount}=req.body;
+    const {telegramId,kpayName,transactionId,amount,paymentMethod}=req.body;
     if (!telegramId||!kpayName||!transactionId||!amount)
       return res.status(400).json({error:'ကွင်းလပ်များ ဖြည့်ပေးပါ'});
     if (parseInt(amount)<500)
@@ -1369,9 +1371,11 @@ app.post('/api/deposit', async(req,res)=>{
     if (u.isBanned) return res.status(403).json({error:'ကောင်ပိတ်ဆို့ထားသည်'});
     const dup=await Deposit.findOne({transactionId}).lean();
     if (dup) return res.status(400).json({error:'Transaction ID ကို အသုံးပြုပြီးသည်'});
-    const dep=await new Deposit({userId:u.telegramId,kpayName,transactionId,amount:parseInt(amount)}).save();
+    const method = (paymentMethod === 'wave') ? 'wave' : 'kpay';
+    const methodLabel = method === 'wave' ? '🌊 Wave Pay' : '📱 KPay';
+    const dep=await new Deposit({userId:u.telegramId,kpayName,transactionId,amount:parseInt(amount),paymentMethod:method}).save();
     if (bot) bot.telegram.sendMessage(ADMIN_ID,
-      `💰 *ငွေသွင်း တောင်းဆိုမှု*\n👤 ${u.firstName||u.username} (${u.telegramId})\n💵 ${parseInt(amount).toLocaleString()} MMK\n📝 ${kpayName}\n🔢 \`${transactionId}\``,
+      `💰 *ငွေသွင်း တောင်းဆိုမှု*\n👤 ${u.firstName||u.username} (${u.telegramId})\n💵 ${parseInt(amount).toLocaleString()} MMK\n${methodLabel} ဖြင့် သွင်းထားသည်\n📝 ${kpayName}\n🔢 \`${transactionId}\``,
       {parse_mode:'Markdown'}).catch(()=>{});
     res.json({success:true,depositId:dep._id});
   } catch(e){ console.error(e); res.status(500).json({error:'Server error'}); }
@@ -1379,7 +1383,7 @@ app.post('/api/deposit', async(req,res)=>{
 
 app.post('/api/withdraw', async(req,res)=>{
   try {
-    const {telegramId,kpayName,kpayNumber,amount}=req.body;
+    const {telegramId,kpayName,kpayNumber,amount,paymentMethod}=req.body;
     if (!telegramId||!kpayName||!kpayNumber||!amount)
       return res.status(400).json({error:'ကွင်းလပ်များ ဖြည့်ပေးပါ'});
     const amt=parseInt(amount);
@@ -1392,9 +1396,12 @@ app.post('/api/withdraw', async(req,res)=>{
     if (chk.isBanned===true) return res.status(403).json({error:'🚫 ကောင်ပိတ်ဆို့ထားသည်'});
     if (chk.balance<amt) return res.status(400).json({error:`လက်ကျန်ငွေ မလုံလောက်ပါ (ကျန်: ${chk.balance.toLocaleString()} MMK)`});
 
+    const method = (paymentMethod === 'wave') ? 'wave' : 'kpay';
+    const methodLabel = method === 'wave' ? '🌊 Wave Pay' : '📱 KPay';
+
     let wd;
     try {
-      wd=await new Withdrawal({userId:tid,kpayName,kpayNumber,amount:amt}).save();
+      wd=await new Withdrawal({userId:tid,kpayName,kpayNumber,amount:amt,paymentMethod:method}).save();
     } catch(saveErr) {
       console.error('Withdrawal record save err:',saveErr);
       return res.status(500).json({error:'Record သိမ်းမရပါ၊ ထပ်ကြိုးစားပါ'});
@@ -1413,7 +1420,7 @@ app.post('/api/withdraw', async(req,res)=>{
     }
 
     if (bot) bot.telegram.sendMessage(ADMIN_ID,
-      `💸 *ငွေထုတ် တောင်းဆိုမှု*\n👤 ${u.firstName||u.username} (${u.telegramId})\n💵 ${amt.toLocaleString()} MMK\n📝 ${kpayName}\n📱 ${kpayNumber}\n🏦 ကျန်: ${u.balance.toLocaleString()} MMK`,
+      `💸 *ငွေထုတ် တောင်းဆိုမှု*\n👤 ${u.firstName||u.username} (${u.telegramId})\n💵 ${amt.toLocaleString()} MMK\n${methodLabel} ဖြင့် ထုတ်မည်\n📝 ${kpayName}\n📱 ${kpayNumber}\n🏦 ကျန်: ${u.balance.toLocaleString()} MMK`,
       {parse_mode:'Markdown'}).catch(()=>{});
     res.json({success:true,withdrawalId:wd._id,newBalance:u.balance});
   } catch(e){ console.error('withdraw err:',e); res.status(500).json({error:'Server error'}); }
@@ -1616,7 +1623,7 @@ app.post('/api/admin/withdrawals/:id/confirm', isAdmin, async(req,res)=>{
     if (wd.status!=='pending') return res.status(400).json({error:'Already processed'});
     wd.status='confirmed'; wd.processedAt=new Date(); await wd.save();
     if (bot) bot.telegram.sendMessage(wd.userId,
-      `✅ ငွေ ${wd.amount.toLocaleString()} MMK ထုတ်မှု အတည်ပြုပြီး!\nKPay: ${wd.kpayNumber} 🎉`).catch(()=>{});
+      `✅ ငွေ ${wd.amount.toLocaleString()} MMK ထုတ်မှု အတည်ပြုပြီး!\n${wd.paymentMethod === 'wave' ? '🌊 Wave Pay' : '📱 KPay'}: ${wd.kpayNumber} 🎉`).catch(()=>{});
     res.json({success:true});
   } catch(e){ res.status(500).json({error:e.message}); }
 });
