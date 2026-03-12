@@ -1007,8 +1007,27 @@ io.on('connection', (socket) => {
             w1 ? User.findOneAndUpdate({telegramId:waiter.userId},{$inc:{balance:ENTRY_FEE}}) : Promise.resolve(),
             w2 ? User.findOneAndUpdate({telegramId:myUserId},{$inc:{balance:ENTRY_FEE}}) : Promise.resolve()
           ]);
-          waitingQueue.push(waiter);
-          return socket.emit('error',{msg:'ငွေ မလုံလောက်ပါ'});
+
+          // ── FIX: differentiate waiter vs joiner failure ──────────────────
+          if (!w1) {
+            // Waiter's balance was insufficient — notify waiter, DO NOT push back to queue
+            const waiterSockId = userSockets.get(waiter.userId);
+            const waiterSock = waiterSockId ? io.sockets.sockets.get(waiterSockId) : null;
+            const wUser = await User.findOne({telegramId:waiter.userId}).select('balance').lean();
+            if (waiterSock) {
+              waiterSock.emit('insufficientBalance', {balance: wUser?.balance||0, required: ENTRY_FEE});
+            }
+            // Waiter removed from queue (already spliced) — they must re-search with sufficient balance
+          } else {
+            // Waiter's balance was fine — push waiter back to queue so others can match
+            waitingQueue.push(waiter);
+          }
+
+          if (!w2) {
+            const jUser = await User.findOne({telegramId:myUserId}).select('balance').lean();
+            return socket.emit('insufficientBalance', {balance: jUser?.balance||0, required: ENTRY_FEE});
+          }
+          return;
         }
       } catch(e) {
         waitingQueue.push(waiter);
@@ -1563,7 +1582,17 @@ app.post('/api/admin/fakenotifinterval', isAdmin, async(req,res)=>{
 
 app.get('/api/admin/deposits', isAdmin, async(req,res)=>{
   try {
-    const deps=await Deposit.find({status:req.query.status||'pending'}).sort({createdAt:-1}).limit(50).lean();
+    // ── FIX: Exclude deposits from agent-referred users (agents handle those) ──
+    const agents = await User.find({role:'agent'}).select('telegramId').lean();
+    const agentIds = agents.map(a => a.telegramId);
+    const agentReferredUserIds = agentIds.length
+      ? (await User.find({referredBy:{$in:agentIds}}).select('telegramId').lean()).map(u=>u.telegramId)
+      : [];
+
+    const query = { status: req.query.status||'pending' };
+    if (agentReferredUserIds.length) query.userId = { $nin: agentReferredUserIds };
+
+    const deps=await Deposit.find(query).sort({createdAt:-1}).limit(50).lean();
     const out=await Promise.all(deps.map(async d=>{
       const u=await User.findOne({telegramId:d.userId}).select('firstName username').lean();
       return {...d,userName:u?.firstName||u?.username||String(d.userId)};
