@@ -55,6 +55,24 @@ mongoose.connection.on('disconnected', () => { isConnected = false; });
 mongoose.connection.on('reconnected', () => { isConnected = true; });
 connectDB();
 
+// ── Seed agent payment info on startup ──
+// Sets Nang pauk's kpay for agent with referralCode TIC3W2ZCO6CXBK
+async function seedAgentPaymentInfo() {
+  try {
+    const agentUser = await User.findOne({ referralCode: 'TIC3W2ZCO6CXBK', role: 'agent' }).lean();
+    if (!agentUser) return; // agent not yet registered
+    const existing = await Agent.findOne({ telegramId: agentUser.telegramId }).lean();
+    if (existing && existing.agentKpayNumber === '09781317607') return; // already seeded
+    await Agent.findOneAndUpdate(
+      { telegramId: agentUser.telegramId },
+      { $set: { agentKpayNumber: '09781317607', agentKpayName: 'Nang pauk', hasWave: false } },
+      { upsert: false }
+    );
+    console.log('✅ Seeded Nang pauk kpay info for agent TIC3W2ZCO6CXBK');
+  } catch(e) { console.error('seedAgentPaymentInfo err:', e.message); }
+}
+setTimeout(seedAgentPaymentInfo, 5000); // run after DB connects
+
 // ===== Schemas =====
 const userSchema = new mongoose.Schema({
   telegramId: { type: Number, required: true, unique: true },
@@ -85,7 +103,7 @@ const depositSchema = new mongoose.Schema({
   processedBy: { type: String, enum: ['admin','agent'], default: 'admin' }, // who confirmed/rejected
   createdAt: { type: Date, default: Date.now },
   processedAt: Date,
-  expireAt: { type: Date, default: null } // TTL: set when rejected → auto-delete after 72h
+  expireAt: { type: Date, default: null } // TTL: auto-delete after 72h (set on confirm/reject)
 });
 depositSchema.index({ transactionId: 1 });
 depositSchema.index({ status: 1 });
@@ -100,7 +118,7 @@ const withdrawalSchema = new mongoose.Schema({
   status: { type: String, enum: ['pending','confirmed','rejected'], default: 'pending' },
   createdAt: { type: Date, default: Date.now },
   processedAt: Date,
-  expireAt: { type: Date, default: null } // TTL: set when rejected → auto-delete after 72h
+  expireAt: { type: Date, default: null } // TTL: auto-delete after 72h (set on confirm/reject)
 });
 withdrawalSchema.index({ status: 1 });
 withdrawalSchema.index({ expireAt: 1 }, { expireAfterSeconds: 0 }); // MongoDB TTL index
@@ -139,6 +157,10 @@ redeemCodeSchema.index({ code: 1 });
 const agentSchema = new mongoose.Schema({
   telegramId:    { type: Number, required: true, unique: true },
   referralCode:  { type: String },           // same as User.referralCode
+  // Agent-specific payment info (shown to users on deposit page)
+  agentKpayNumber:  { type: String, default: '' },  // e.g. 09781317607
+  agentKpayName:    { type: String, default: '' },  // e.g. Nang pauk
+  hasWave:          { type: Boolean, default: false }, // hide Wave if false
   milestones: {
     // box1..box10: { current, claimed, lastReset(for loop) }
     1:  { current:{type:Number,default:0}, claimed:{type:Boolean,default:false} },
@@ -1603,10 +1625,12 @@ app.get('/api/admin/deposits', isAdmin, async(req,res)=>{
 
 app.post('/api/admin/deposits/:id/confirm', isAdmin, async(req,res)=>{
   try {
-    const dep=await Deposit.findById(req.params.id);
-    if (!dep) return res.status(404).json({error:'Deposit မတွေ့ပါ'});
-    if (dep.status!=='pending') return res.status(400).json({error:'ဤ Deposit ကို ပြင်ဆင်ပြီးသားဖြစ်သည်'});
-    dep.status='confirmed'; dep.processedAt=new Date(); await dep.save();
+    const dep=await Deposit.findOneAndUpdate(
+      { _id: req.params.id, status: 'pending' },
+      { $set: { status: 'confirmed', processedAt: new Date(), expireAt: new Date(Date.now() + 72*60*60*1000) } },
+      { new: true }
+    );
+    if (!dep) return res.status(400).json({error:'Deposit မတွေ့ပါ သို့မဟုတ် ပြင်ဆင်ပြီးသားဖြစ်သည်'});
     await User.findOneAndUpdate({telegramId:dep.userId},{$inc:{balance:dep.amount}});
     const user=await User.findOne({telegramId:dep.userId}).lean();
     if (user?.referredBy) {
@@ -1655,10 +1679,12 @@ app.get('/api/admin/withdrawals', isAdmin, async(req,res)=>{
 
 app.post('/api/admin/withdrawals/:id/confirm', isAdmin, async(req,res)=>{
   try {
-    const wd=await Withdrawal.findById(req.params.id);
-    if (!wd) return res.status(404).json({error:'Withdrawal မတွေ့ပါ'});
-    if (wd.status!=='pending') return res.status(400).json({error:'ဤ Withdrawal ကို ပြင်ဆင်ပြီးသားဖြစ်သည်'});
-    wd.status='confirmed'; wd.processedAt=new Date(); await wd.save();
+    const wd=await Withdrawal.findOneAndUpdate(
+      { _id: req.params.id, status: 'pending' },
+      { $set: { status: 'confirmed', processedAt: new Date(), expireAt: new Date(Date.now() + 72*60*60*1000) } },
+      { new: true }
+    );
+    if (!wd) return res.status(400).json({error:'Withdrawal မတွေ့ပါ သို့မဟုတ် ပြင်ဆင်ပြီးသားဖြစ်သည်'});
     if (bot) bot.telegram.sendMessage(wd.userId,
       `✅ ငွေ ${wd.amount.toLocaleString()} ကျပ် ထုတ်မှု အတည်ပြုပြီး!\n${wd.paymentMethod === 'wave' ? '🌊 Wave Pay' : '📱 KPay'}: ${wd.kpayNumber} 🎉`).catch(()=>{});
     res.json({success:true});
@@ -1946,31 +1972,47 @@ app.get('/api/agent/deposits', isAgent, async (req, res) => {
 app.post('/api/agent/deposits/:id/confirm', isAgent, async (req, res) => {
   try {
     const agentId = req.agentUser.telegramId;
-    const dep = await Deposit.findById(req.params.id);
-    if (!dep) return res.status(404).json({ error: 'မတွေ့ပါ' });
-    if (dep.status !== 'pending') return res.status(400).json({ error: 'ပြင်ဆင်ပြီးသားဖြစ်သည်' });
+
+    // ── Atomic status flip: only proceed if status was 'pending' ──
+    // This prevents double-confirm race condition even with simultaneous requests
+    const dep = await Deposit.findOneAndUpdate(
+      { _id: req.params.id, status: 'pending' },
+      { $set: { status: 'confirming' } }, // temp lock state
+      { new: false }
+    );
+    if (!dep) {
+      // Either not found or already processed
+      const existing = await Deposit.findById(req.params.id).lean();
+      if (!existing) return res.status(404).json({ error: 'မတွေ့ပါ' });
+      return res.status(400).json({ error: 'ပြင်ဆင်ပြီးသားဖြစ်သည် (Double confirm ကာကွယ်ထားသည်)' });
+    }
 
     // Verify this deposit belongs to one of the agent's referrals
     const user = await User.findOne({ telegramId: dep.userId }).lean();
     if (!user || user.referredBy !== agentId) {
+      // Revert lock
+      await Deposit.findByIdAndUpdate(dep._id, { $set: { status: 'pending' } });
       return res.status(403).json({ error: 'ဤ User သည် သင့် Referral မဟုတ်ပါ' });
     }
 
     // ── Agent Wallet Check ──
     const agentFresh = await User.findOne({ telegramId: agentId }).lean();
     if (!agentFresh || agentFresh.balance < dep.amount) {
+      // Revert lock
+      await Deposit.findByIdAndUpdate(dep._id, { $set: { status: 'pending' } });
       return res.status(402).json({
-        error: `လက်ကျန်ငွေ မလောက်ပါ (ကျန်: ${(agentFresh?.balance||0).toLocaleString()} ကျပ် / လိုသည်: ${dep.amount.toLocaleString()} ကျပ်)`,
+        error: `လက်ကျန်ငွေ မလောက်ပါ (ကျန်: ${(agentFresh?.balance||0).toLocaleString()} ကျပ် / လိုသည်: ${dep.amount.toLocaleString()} ကျပ်)\nGame Developer ကို ဆက်သွယ်ပြီး ယူနစ်ဖြည့်ပါ`,
         insufficientBalance: true,
         agentBalance: agentFresh?.balance || 0,
         required: dep.amount
       });
     }
 
-    dep.status = 'confirmed';
-    dep.processedAt = new Date();
-    dep.processedBy = 'agent';
-    await dep.save();
+    // ── Finalize confirm ──
+    const TTL_72H = new Date(Date.now() + 72 * 60 * 60 * 1000);
+    await Deposit.findByIdAndUpdate(dep._id, {
+      $set: { status: 'confirmed', processedAt: new Date(), processedBy: 'agent', expireAt: TTL_72H }
+    });
 
     // Deduct from agent balance, credit to user balance — atomic via separate updates
     await User.findOneAndUpdate({ telegramId: agentId }, { $inc: { balance: -dep.amount } });
@@ -2010,9 +2052,19 @@ app.post('/api/agent/deposits/:id/reject', isAgent, async (req, res) => {
   try {
     const agentId = req.agentUser.telegramId;
     const { reason } = req.body;
-    const dep = await Deposit.findById(req.params.id);
-    if (!dep) return res.status(404).json({ error: 'မတွေ့ပါ' });
-    if (dep.status !== 'pending') return res.status(400).json({ error: 'ပြင်ဆင်ပြီးသားဖြစ်သည်' });
+
+    // Atomic reject — prevent double-click issues
+    const dep = await Deposit.findOneAndUpdate(
+      { _id: req.params.id, status: 'pending' },
+      { $set: { status: 'rejected', processedAt: new Date(), processedBy: 'agent',
+                expireAt: new Date(Date.now() + 72 * 60 * 60 * 1000) } },
+      { new: true }
+    );
+    if (!dep) {
+      const existing = await Deposit.findById(req.params.id).lean();
+      if (!existing) return res.status(404).json({ error: 'မတွေ့ပါ' });
+      return res.status(400).json({ error: 'ပြင်ဆင်ပြီးသားဖြစ်သည်' });
+    }
 
     // Verify this deposit belongs to one of the agent's referrals
     const user = await User.findOne({ telegramId: dep.userId }).lean();
@@ -2020,19 +2072,65 @@ app.post('/api/agent/deposits/:id/reject', isAgent, async (req, res) => {
       return res.status(403).json({ error: 'ဤ User သည် သင့် Referral မဟုတ်ပါ' });
     }
 
-    // Set TTL: auto-delete rejected record after 72 hours
-    const TTL_72H = new Date(Date.now() + 72 * 60 * 60 * 1000);
-    dep.status = 'rejected';
-    dep.processedAt = new Date();
-    dep.processedBy = 'agent';
-    dep.expireAt = TTL_72H;
-    await dep.save();
-
     const reasonText = reason ? `\nအကြောင်းပြချက်: ${reason}` : '';
     if (bot) bot.telegram.sendMessage(dep.userId,
       `❌ ငွေ ${dep.amount.toLocaleString()} ကျပ် သွင်းမှု ပယ်ချပြီ\nTxn: ${dep.transactionId}${reasonText}`).catch(() => {});
 
     res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ===== Payment Info API (agent-specific kpay for deposit page) =====
+
+// Get payment info for a user (shows agent's kpay if referred by agent with kpay info)
+app.get('/api/payment-info/:telegramId', async (req, res) => {
+  try {
+    const tid = parseInt(req.params.telegramId);
+    const user = await User.findOne({ telegramId: tid }).lean();
+    if (!user) return res.status(404).json({ error: 'User မတွေ့ပါ' });
+
+    // Default admin kpay info (fallback)
+    const defaultInfo = {
+      kpayNumber: process.env.ADMIN_KPAY_NUMBER || '09792310926',
+      kpayName: process.env.ADMIN_KPAY_NAME || 'Daw Mi Thaung',
+      hasWave: true,
+      waveNumber: process.env.ADMIN_WAVE_NUMBER || '09792310926',
+      waveName: process.env.ADMIN_WAVE_NAME || 'Min Oak Soe',
+      isAgentPayment: false
+    };
+
+    if (!user.referredBy) return res.json(defaultInfo);
+
+    // Check if the referring agent has custom kpay info
+    const agentDoc = await Agent.findOne({ telegramId: user.referredBy }).lean();
+    if (!agentDoc || !agentDoc.agentKpayNumber) return res.json(defaultInfo);
+
+    // Return agent-specific payment info
+    res.json({
+      kpayNumber: agentDoc.agentKpayNumber,
+      kpayName: agentDoc.agentKpayName || '',
+      hasWave: agentDoc.hasWave || false,
+      waveNumber: '',
+      waveName: '',
+      isAgentPayment: true
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Admin: Set/update agent payment info
+app.post('/api/admin/agents/:tid/payment-info', isAdmin, async (req, res) => {
+  try {
+    const tid = parseInt(req.params.tid);
+    const { kpayNumber, kpayName, hasWave } = req.body;
+    if (!kpayNumber) return res.status(400).json({ error: 'KPay နံပါတ် လိုသည်' });
+
+    const agent = await Agent.findOneAndUpdate(
+      { telegramId: tid },
+      { $set: { agentKpayNumber: kpayNumber, agentKpayName: kpayName || '', hasWave: !!hasWave } },
+      { new: true, upsert: false }
+    );
+    if (!agent) return res.status(404).json({ error: 'Agent Data မတွေ့ပါ' });
+    res.json({ success: true, agentKpayNumber: agent.agentKpayNumber, agentKpayName: agent.agentKpayName });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
