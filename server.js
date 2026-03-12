@@ -82,11 +82,14 @@ const depositSchema = new mongoose.Schema({
   amount: { type: Number, required: true },
   paymentMethod: { type: String, enum: ['kpay','wave'], default: 'kpay' },
   status: { type: String, enum: ['pending','confirmed','rejected'], default: 'pending' },
+  processedBy: { type: String, enum: ['admin','agent'], default: 'admin' }, // who confirmed/rejected
   createdAt: { type: Date, default: Date.now },
-  processedAt: Date
+  processedAt: Date,
+  expireAt: { type: Date, default: null } // TTL: set when rejected → auto-delete after 72h
 });
 depositSchema.index({ transactionId: 1 });
 depositSchema.index({ status: 1 });
+depositSchema.index({ expireAt: 1 }, { expireAfterSeconds: 0 }); // MongoDB TTL index
 
 const withdrawalSchema = new mongoose.Schema({
   userId: { type: Number, required: true },
@@ -96,9 +99,11 @@ const withdrawalSchema = new mongoose.Schema({
   paymentMethod: { type: String, enum: ['kpay','wave'], default: 'kpay' },
   status: { type: String, enum: ['pending','confirmed','rejected'], default: 'pending' },
   createdAt: { type: Date, default: Date.now },
-  processedAt: Date
+  processedAt: Date,
+  expireAt: { type: Date, default: null } // TTL: set when rejected → auto-delete after 72h
 });
 withdrawalSchema.index({ status: 1 });
+withdrawalSchema.index({ expireAt: 1 }, { expireAfterSeconds: 0 }); // MongoDB TTL index
 
 const gameSchema = new mongoose.Schema({
   gameId: { type: String, required: true, unique: true },
@@ -1596,7 +1601,10 @@ app.post('/api/admin/deposits/:id/confirm', isAdmin, async(req,res)=>{
 app.post('/api/admin/deposits/:id/reject', isAdmin, async(req,res)=>{
   try {
     const { reason } = req.body;
-    const dep=await Deposit.findByIdAndUpdate(req.params.id,{status:'rejected',processedAt:new Date()},{new:true});
+    const TTL_72H = new Date(Date.now() + 72 * 60 * 60 * 1000);
+    const dep=await Deposit.findByIdAndUpdate(req.params.id,
+      {status:'rejected', processedAt:new Date(), expireAt:TTL_72H},
+      {new:true});
     if (!dep) return res.status(404).json({error:'Not found'});
     const reasonText = reason ? `\nအကြောင်းပြချက်: ${reason}` : '';
     if (bot) bot.telegram.sendMessage(dep.userId,
@@ -1633,7 +1641,9 @@ app.post('/api/admin/withdrawals/:id/reject', isAdmin, async(req,res)=>{
     const wd=await Withdrawal.findById(req.params.id);
     if (!wd) return res.status(404).json({error:'Not found'});
     if (wd.status!=='pending') return res.status(400).json({error:'Already processed'});
-    wd.status='rejected'; wd.processedAt=new Date(); await wd.save();
+    const TTL_72H = new Date(Date.now() + 72 * 60 * 60 * 1000);
+    wd.status='rejected'; wd.processedAt=new Date(); wd.expireAt=TTL_72H;
+    await wd.save();
     await User.findOneAndUpdate({telegramId:wd.userId},{$inc:{balance:wd.amount}});
     if (bot) bot.telegram.sendMessage(wd.userId,
       `❌ ငွေ ${wd.amount.toLocaleString()} ကျပ် ထုတ်မှု ပယ်ချပြီး ငွေပြန်အမ်းပြီ`).catch(()=>{});
@@ -1771,6 +1781,17 @@ app.get('/api/agent/panel', isAgent, async (req, res) => {
       await agent.save();
     }
     const totalReferrals = await User.countDocuments({ referredBy: user.telegramId });
+
+    // Total Sales: sum of all confirmed deposits from agent's referral users
+    const referredIds = (await User.find({ referredBy: user.telegramId }).select('telegramId').lean()).map(u => u.telegramId);
+    const salesAgg = referredIds.length
+      ? await Deposit.aggregate([
+          { $match: { userId: { $in: referredIds }, status: 'confirmed' } },
+          { $group: { _id: null, total: { $sum: '$amount' } } }
+        ])
+      : [];
+    const totalSales = salesAgg[0]?.total || 0;
+
     res.json({
       telegramId: user.telegramId,
       firstName: user.firstName,
@@ -1781,7 +1802,8 @@ app.get('/api/agent/panel', isAgent, async (req, res) => {
       milestones: agent.milestones,
       totalEarned: agent.totalEarned,
       completedBoxes: agent.completedBoxes,
-      totalReferrals
+      totalReferrals,
+      totalSales
     });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -1905,14 +1927,27 @@ app.post('/api/agent/deposits/:id/confirm', isAgent, async (req, res) => {
       return res.status(403).json({ error: 'ဤ User သည် သင့် Referral မဟုတ်ပါ' });
     }
 
+    // ── Agent Wallet Check ──
+    const agentFresh = await User.findOne({ telegramId: agentId }).lean();
+    if (!agentFresh || agentFresh.balance < dep.amount) {
+      return res.status(402).json({
+        error: `လက်ကျန်ငွေ မလောက်ပါ (ကျန်: ${(agentFresh?.balance||0).toLocaleString()} ကျပ် / လိုသည်: ${dep.amount.toLocaleString()} ကျပ်)`,
+        insufficientBalance: true,
+        agentBalance: agentFresh?.balance || 0,
+        required: dep.amount
+      });
+    }
+
     dep.status = 'confirmed';
     dep.processedAt = new Date();
+    dep.processedBy = 'agent';
     await dep.save();
 
-    // Credit user balance
+    // Deduct from agent balance, credit to user balance — atomic via separate updates
+    await User.findOneAndUpdate({ telegramId: agentId }, { $inc: { balance: -dep.amount } });
     await User.findOneAndUpdate({ telegramId: dep.userId }, { $inc: { balance: dep.amount } });
 
-    // First deposit referral bonus (100 MMK to agent)
+    // First deposit referral bonus (100 ကျပ် to agent)
     const prevDeps = await Deposit.countDocuments({ userId: dep.userId, status: 'confirmed', _id: { $ne: dep._id } });
     if (prevDeps === 0) {
       await User.findOneAndUpdate({ telegramId: agentId }, { $inc: { balance: 100 } });
@@ -1929,6 +1964,13 @@ app.post('/api/agent/deposits/:id/confirm', isAgent, async (req, res) => {
     if (bot) bot.telegram.sendMessage(dep.userId,
       `✅ ငွေ ${dep.amount.toLocaleString()} ကျပ် သွင်းမှု အတည်ပြုပြီး!\n${methodLabel}\n\nသင့်လက်ကျန်ငွေ ပေါင်းထည့်ပြီး 🎉`,
       Markup.inlineKeyboard([[Markup.button.webApp('🎮 ကစားမည်', FRONTEND_URL)]]) ).catch(() => {});
+
+    // Notify Admin about agent-confirmed deposit (record keeping)
+    const agentName = agentFresh.firstName || agentFresh.username || `Agent${agentId}`;
+    const userName = user.firstName || user.username || `User${dep.userId}`;
+    if (bot) bot.telegram.sendMessage(ADMIN_ID,
+      `🎯 <b>Agent မှ Deposit Confirm</b>\n👤 User: ${userName} (${dep.userId})\n💰 ${dep.amount.toLocaleString()} ကျပ် (${methodLabel})\n🎯 Agent: ${agentName} (${agentId})\n🔢 Txn: <code>${dep.transactionId}</code>`,
+      { parse_mode: 'HTML' }).catch(() => {});
 
     res.json({ success: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
@@ -1949,8 +1991,12 @@ app.post('/api/agent/deposits/:id/reject', isAgent, async (req, res) => {
       return res.status(403).json({ error: 'ဤ User သည် သင့် Referral မဟုတ်ပါ' });
     }
 
+    // Set TTL: auto-delete rejected record after 72 hours
+    const TTL_72H = new Date(Date.now() + 72 * 60 * 60 * 1000);
     dep.status = 'rejected';
     dep.processedAt = new Date();
+    dep.processedBy = 'agent';
+    dep.expireAt = TTL_72H;
     await dep.save();
 
     const reasonText = reason ? `\nအကြောင်းပြချက်: ${reason}` : '';
@@ -1958,6 +2004,75 @@ app.post('/api/agent/deposits/:id/reject', isAgent, async (req, res) => {
       `❌ ငွေ ${dep.amount.toLocaleString()} ကျပ် သွင်းမှု ပယ်ချပြီ\nTxn: ${dep.transactionId}${reasonText}`).catch(() => {});
 
     res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Admin: Balance top-up for agent
+app.post('/api/admin/agents/:tid/balance', isAdmin, async (req, res) => {
+  try {
+    const tid = parseInt(req.params.tid);
+    const { amount, reason } = req.body;
+    const amt = parseInt(amount);
+    if (isNaN(amt) || amt === 0) return res.status(400).json({ error: 'Amount မှားနေသည်' });
+    const u = await User.findOneAndUpdate(
+      { telegramId: tid, role: 'agent' },
+      { $inc: { balance: amt } },
+      { new: true }
+    );
+    if (!u) return res.status(404).json({ error: 'Agent မတွေ့ပါ' });
+    if (bot) {
+      const sign = amt > 0 ? '+' : '';
+      bot.telegram.sendMessage(tid,
+        `💰 <b>Admin မှ Balance ဖြည့်ပေးသည်</b>\n${sign}${amt.toLocaleString()} ကျပ်${reason ? `\nမှတ်ချက်: ${reason}` : ''}\n🏦 လက်ကျန်: ${u.balance.toLocaleString()} ကျပ်`,
+        { parse_mode: 'HTML' }).catch(() => {});
+    }
+    res.json({ success: true, newBalance: u.balance });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Admin: Invited-from-agent overview (per-agent stats)
+app.get('/api/admin/agent-referrals', isAdmin, async (req, res) => {
+  try {
+    const agents = await User.find({ role: 'agent' })
+      .select('telegramId firstName username balance')
+      .sort({ createdAt: -1 }).lean();
+
+    const result = await Promise.all(agents.map(async agent => {
+      const referredUsers = await User.find({ referredBy: agent.telegramId })
+        .select('telegramId firstName username balance createdAt').lean();
+
+      const referredIds = referredUsers.map(u => u.telegramId);
+
+      // Active referrals: those who have at least 1 confirmed deposit
+      let activeCount = 0;
+      let totalSales = 0;
+      if (referredIds.length) {
+        const depositors = await Deposit.aggregate([
+          { $match: { userId: { $in: referredIds }, status: 'confirmed' } },
+          { $group: { _id: '$userId', total: { $sum: '$amount' } } }
+        ]);
+        activeCount = depositors.length;
+        totalSales = depositors.reduce((s, d) => s + d.total, 0);
+      }
+
+      return {
+        agentId: agent.telegramId,
+        agentName: agent.firstName || agent.username || `Agent${agent.telegramId}`,
+        agentBalance: agent.balance || 0,
+        totalReferrals: referredUsers.length,
+        activeReferrals: activeCount,
+        totalSales,
+        referrals: referredUsers.map(u => ({
+          telegramId: u.telegramId,
+          name: u.firstName || u.username || `User${u.telegramId}`,
+          username: u.username || '',
+          balance: u.balance || 0,
+          joinedAt: u.createdAt
+        }))
+      };
+    }));
+
+    res.json(result);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
