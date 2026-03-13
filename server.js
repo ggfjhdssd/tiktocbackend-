@@ -87,6 +87,7 @@ const userSchema = new mongoose.Schema({
   isBanned: { type: Boolean, default: false },
   role: { type: String, enum: ['user','agent'], default: 'user' },
   botMode: { type: Boolean, default: false },
+  botMatchCount: { type: Number, default: 0 },
   lastActive: { type: Date, default: Date.now },
   createdAt: { type: Date, default: Date.now }
 });
@@ -128,7 +129,7 @@ const gameSchema = new mongoose.Schema({
   players: [Number],
   playerNames: { type: Map, of: String, default: {} },
   symbols: { type: Map, of: String },
-  board: { type: [[String]], default: () => Array(5).fill(null).map(() => Array(5).fill('')) },
+  board: { type: [[String]], default: () => Array(6).fill(null).map(() => Array(6).fill('')) },
   winner: { type: mongoose.Schema.Types.Mixed, default: null },
   winnerName: { type: String, default: '' },
   status: { type: String, enum: ['waiting','active','completed'], default: 'waiting' },
@@ -248,18 +249,22 @@ function verifyTgAuth(initData) {
   } catch { return null; }
 }
 
+// ===== Board Constants =====
+const BOARD_SIZE = 6;
+const WIN_LEN = 5;
+
 function checkWin(board, sym) {
   const dirs = [[0,1],[1,0],[1,1],[1,-1]];
-  for (let r=0;r<5;r++) for (let c=0;c<5;c++) {
+  for (let r=0;r<BOARD_SIZE;r++) for (let c=0;c<BOARD_SIZE;c++) {
     if (board[r][c] !== sym) continue;
     for (const [dr,dc] of dirs) {
       let cnt=1;
-      for (let i=1;i<4;i++) {
+      for (let i=1;i<WIN_LEN;i++) {
         const nr=r+dr*i,nc=c+dc*i;
-        if (nr<0||nr>=5||nc<0||nc>=5||board[nr][nc]!==sym) break;
+        if (nr<0||nr>=BOARD_SIZE||nc<0||nc>=BOARD_SIZE||board[nr][nc]!==sym) break;
         cnt++;
       }
-      if (cnt>=4) return true;
+      if (cnt>=WIN_LEN) return true;
     }
   }
   return false;
@@ -285,55 +290,161 @@ function wouldWin(board, r, c, sym) {
   board[r][c] = '';
   return w;
 }
-function scoreBoard(board, sym, oppSym) {
-  const dirs = [[0,1],[1,0],[1,1],[1,-1]];
-  let best = null, bestScore = -1;
-  for (let r=0;r<5;r++) for (let c=0;c<5;c++) {
-    if (board[r][c] !== '') continue;
-    let score = (2-Math.abs(r-2)) + (2-Math.abs(c-2));
-    for (const [dr,dc] of dirs) {
-      let cnt=0, blocked=false;
-      for (let i=-3;i<=3;i++) {
-        const nr=r+dr*i, nc=c+dc*i;
-        if (nr<0||nr>=5||nc<0||nc>=5) continue;
-        if (board[nr][nc]===sym) cnt++;
-        else if (board[nr][nc]===oppSym) { blocked=true; break; }
-      }
-      if (!blocked) score += cnt*3;
-    }
-    if (score > bestScore) { bestScore=score; best={r,c}; }
+
+// ── Hard Mode Heuristic Scoring (6x6, 5-in-a-row) ──────────────────────────
+
+// Count consecutive sym pieces from (r,c) in direction (dr,dc), not including (r,c) itself
+function countStreak(board, r, c, dr, dc, sym) {
+  let cnt = 0;
+  let nr = r + dr, nc = c + dc;
+  while (nr >= 0 && nr < BOARD_SIZE && nc >= 0 && nc < BOARD_SIZE && board[nr][nc] === sym) {
+    cnt++; nr += dr; nc += dc;
   }
-  return best;
+  return cnt;
 }
-function aiPickMove(board, aiSym, humanSym) {
-  // 1) Win immediately
-  for (let r=0;r<5;r++) for (let c=0;c<5;c++) {
-    if (board[r][c]==='' && wouldWin(board,r,c,aiSym)) return {r,c};
+
+// Is the next cell in direction (dr,dc) from streak endpoint open (empty)?
+function isEndOpen(board, r, c, dr, dc, streak) {
+  const nr = r + dr*(streak+1), nc = c + dc*(streak+1);
+  return nr >= 0 && nr < BOARD_SIZE && nc >= 0 && nc < BOARD_SIZE && board[nr][nc] === '';
+}
+
+// Heuristic score for a line through (r,c) based on streak and openness
+function lineScore(total, openEnds) {
+  if (total >= WIN_LEN) return 100000;   // 5-in-a-row
+  if (total === 4) {
+    if (openEnds === 2) return 5000;     // Open 4 (double threat, must block!)
+    if (openEnds === 1) return 2000;     // Half-open 4
+    return 200;
   }
-  // 2) Block human win
-  for (let r=0;r<5;r++) for (let c=0;c<5;c++) {
-    if (board[r][c]==='' && wouldWin(board,r,c,humanSym)) return {r,c};
+  if (total === 3) {
+    if (openEnds === 2) return 1000;     // Open 3
+    if (openEnds === 1) return 300;
+    return 50;
   }
-  // 3) Strategic score
-  const best = scoreBoard(board, aiSym, humanSym);
-  if (best) return best;
-  // 4) Fallback
-  for (let r=0;r<5;r++) for (let c=0;c<5;c++) {
-    if (board[r][c]==='') return {r,c};
+  if (total === 2) {
+    if (openEnds === 2) return 100;
+    if (openEnds === 1) return 25;
+    return 5;
   }
-  return null;
+  return 0;
+}
+
+// Evaluate heuristic attack/defense score for placing `sym` at (r,c)
+function evalCell(board, r, c, sym, oppSym) {
+  if (board[r][c] !== '') return -Infinity;
+  const dirs = [[0,1],[1,0],[1,1],[1,-1]];
+
+  // Center bonus — cells closer to center (2.5, 2.5) are worth more
+  const center = (BOARD_SIZE - 1) / 2;
+  const centerBonus = (center - Math.abs(r - center)) + (center - Math.abs(c - center));
+
+  board[r][c] = sym; // temporarily place
+  let score = centerBonus * 8;
+
+  for (const [dr, dc] of dirs) {
+    const fwd  = countStreak(board, r, c,  dr,  dc, sym);
+    const bwd  = countStreak(board, r, c, -dr, -dc, sym);
+    const total = fwd + bwd + 1;
+
+    const fwdOpen = isEndOpen(board, r, c,  dr,  dc, fwd);
+    const bwdOpen = isEndOpen(board, r, c, -dr, -dc, bwd);
+    const openEnds = (fwdOpen ? 1 : 0) + (bwdOpen ? 1 : 0);
+
+    score += lineScore(total, openEnds);
+  }
+
+  board[r][c] = ''; // restore
+  return score;
+}
+
+// Detect double-attack potential: count how many open-3 (or open-4) threats exist after placing
+function countThreats(board, r, c, sym, minLen) {
+  if (board[r][c] !== '') return 0;
+  const dirs = [[0,1],[1,0],[1,1],[1,-1]];
+  board[r][c] = sym;
+  let threats = 0;
+  for (const [dr, dc] of dirs) {
+    const fwd  = countStreak(board, r, c,  dr,  dc, sym);
+    const bwd  = countStreak(board, r, c, -dr, -dc, sym);
+    const total = fwd + bwd + 1;
+    const fwdOpen = isEndOpen(board, r, c,  dr,  dc, fwd);
+    const bwdOpen = isEndOpen(board, r, c, -dr, -dc, bwd);
+    if (total >= minLen && (fwdOpen || bwdOpen)) threats++;
+  }
+  board[r][c] = '';
+  return threats;
+}
+
+// Main AI move picker — supports mercy mode (3rd game: let user win)
+function aiPickMove(board, aiSym, humanSym, mercyMode = false) {
+  const empty = [];
+  for (let r=0;r<BOARD_SIZE;r++) for (let c=0;c<BOARD_SIZE;c++) {
+    if (board[r][c] === '') empty.push({r,c});
+  }
+  if (!empty.length) return null;
+
+  // ── Mercy Mode: every 3rd game, let user win ────────────────────────────────
+  // If user has a 4-in-a-row threat (one move away from winning), play elsewhere
+  if (mercyMode) {
+    const winCells = empty.filter(({r,c}) => wouldWin(board,r,c,humanSym));
+    if (winCells.length > 0) {
+      // Intentionally skip blocking — play a random non-winning, non-blocking cell
+      const nonBlock = empty.filter(e => !winCells.find(w=>w.r===e.r&&w.c===e.c));
+      const pool = nonBlock.length > 0 ? nonBlock : empty;
+      // Pick from corners/edges to look natural
+      return pool[Math.floor(Math.random() * Math.min(pool.length, 4))];
+    }
+  }
+
+  // ── Step 1: Win immediately ─────────────────────────────────────────────────
+  for (const {r,c} of empty) {
+    if (wouldWin(board,r,c,aiSym)) return {r,c};
+  }
+
+  // ── Step 2: Block human immediate win ──────────────────────────────────────
+  for (const {r,c} of empty) {
+    if (wouldWin(board,r,c,humanSym)) return {r,c};
+  }
+
+  // ── Step 3: Create double attack (two open-4s or open-3s simultaneously) ──
+  for (const {r,c} of empty) {
+    if (countThreats(board,r,c,aiSym,4) >= 2) return {r,c};
+  }
+
+  // ── Step 4: Block human double attack ──────────────────────────────────────
+  for (const {r,c} of empty) {
+    if (countThreats(board,r,c,humanSym,4) >= 2) return {r,c};
+  }
+
+  // ── Step 5: Full heuristic scoring ─────────────────────────────────────────
+  let best = null, bestScore = -Infinity;
+  for (const {r,c} of empty) {
+    const attackScore = evalCell(board, r, c, aiSym, humanSym);
+    const defenseScore = evalCell(board, r, c, humanSym, aiSym);
+    // Weight offense slightly higher to favor winning over pure defense
+    const combined = attackScore + defenseScore * 0.9;
+    if (combined > bestScore) { bestScore = combined; best = {r,c}; }
+  }
+
+  return best || empty[0];
 }
 
 // ===== Sabotage AI Game Functions =====
 async function startSabotageAIGame(socket, userId, gameId, userName) {
+  // Increment botMatchCount and determine mercy mode (every 3rd game)
   const u = await User.findOneAndUpdate(
     { telegramId: userId, balance: { $gte: ENTRY_FEE }, isBanned: { $ne: true } },
-    { $inc: { balance: -ENTRY_FEE } },
+    { $inc: { balance: -ENTRY_FEE, botMatchCount: 1 } },
     { new: true }
   );
   if (!u) {
     return socket.emit('insufficientBalance', { balance: 0, required: ENTRY_FEE });
   }
+
+  // Mercy: every 3rd game (botMatchCount divisible by 3), let user win
+  const mercyMode = (u.botMatchCount % 3 === 0);
+
   const aiName = randomAIName();
   const symbols = {};
   if (Math.random() > 0.5) { symbols[userId]='X'; symbols[AI_ID]='O'; }
@@ -341,10 +452,11 @@ async function startSabotageAIGame(socket, userId, gameId, userName) {
   const firstTurn = parseInt(Object.entries(symbols).find(([,v])=>v==='X')[0]);
   const gameState = {
     gameId, players:[userId, AI_ID], symbols,
-    board: Array(5).fill(null).map(()=>Array(5).fill('')),
+    board: Array(BOARD_SIZE).fill(null).map(()=>Array(BOARD_SIZE).fill('')),
     currentTurn: firstTurn, status:'active', isAIGame:true,
     aiType: AI_TYPE_SABOTAGE,
-    startedAt: Date.now(), lastMoveAt: Date.now(), // FIX 2: zombie tracking
+    mercyMode,
+    startedAt: Date.now(), lastMoveAt: Date.now(),
     playerNames: { [userId]: userName, [AI_ID]: aiName }
   };
   activeGames.set(gameId, gameState);
@@ -359,7 +471,7 @@ async function startSabotageAIGame(socket, userId, gameId, userName) {
     const t = setTimeout(() => handleTurnTimeoutAI(gameId, userId), TURN_SECONDS*1000+1500);
     gameTurnTimeouts.set(gameId, t);
   }
-  console.log('SABOTAGE AI game started:', gameId, 'User:', userId, 'vs AI:', aiName);
+  console.log(`SABOTAGE AI game started: ${gameId} | User: ${userId} vs AI: ${aiName} | mercy: ${mercyMode}`);
 }
 
 function scheduleSabotageAIMove(gameId) {
@@ -370,7 +482,8 @@ function scheduleSabotageAIMove(gameId) {
     const humanId = game.players.find(p => p !== AI_ID);
     const aiSym = game.symbols[AI_ID];
     const humanSym = game.symbols[humanId];
-    const move = aiPickMove(game.board, aiSym, humanSym);
+    // Pass mercy mode flag to aiPickMove
+    const move = aiPickMove(game.board, aiSym, humanSym, game.mercyMode || false);
     if (!move) return;
     clearTurnTimer(gameId);
     game.board[move.r][move.c] = aiSym;
@@ -1065,7 +1178,7 @@ io.on('connection', (socket) => {
 
       const gameState = {
         gameId:myGameId, players:[waiter.userId,myUserId], symbols,
-        board: Array(5).fill(null).map(()=>Array(5).fill('')),
+        board: Array(BOARD_SIZE).fill(null).map(()=>Array(BOARD_SIZE).fill('')),
         currentTurn:firstTurn, status:'active',
         startedAt: Date.now(), lastMoveAt: Date.now(), // FIX 2: zombie tracking
         playerNames: {
@@ -1142,7 +1255,7 @@ io.on('connection', (socket) => {
         return socket.emit('error',{msg:'AI စဉ်းစားနေဆဲ ဖြစ်သည်'});
       }
       if (game.currentTurn!==myUserId) return socket.emit('error',{msg:'သင့်လှည့် မဟုတ်ပါ'});
-      if (row<0||row>4||col<0||col>4) return socket.emit('error',{msg:'Invalid move'});
+      if (row<0||row>5||col<0||col>5) return socket.emit('error',{msg:'Invalid move'});
       if (game.board[row][col]!=='') return socket.emit('error',{msg:'ထိုနေရာ ယူပြီးသား'});
 
       // ── FIX A: safe symbol lookup (handles both Number & String keys) ──
