@@ -32,8 +32,8 @@ const FRONTEND_URL = process.env.FRONTEND_URL || 'https://tictokfrontend.vercel.
 const BACKEND_URL = process.env.BACKEND_URL || 'https://tiktocbackend-zktq.onrender.com';
 const BOT_USERNAME = process.env.BOT_USERNAME || 'tictoe1_bot';
 const ENTRY_FEE = 500;
-const WIN_PRIZE = 800;
-const DRAW_REFUND = 250;
+const WIN_PRIZE = 900;
+const DRAW_REFUND = 450;
 const TURN_SECONDS = 10;
 const SEARCH_TIMEOUT_S = 60;
 
@@ -129,7 +129,7 @@ const gameSchema = new mongoose.Schema({
   players: [Number],
   playerNames: { type: Map, of: String, default: {} },
   symbols: { type: Map, of: String },
-  board: { type: [[String]], default: () => Array(6).fill(null).map(() => Array(6).fill('')) },
+  board: { type: [[String]], default: () => Array(5).fill(null).map(() => Array(5).fill('')) },
   winner: { type: mongoose.Schema.Types.Mixed, default: null },
   winnerName: { type: String, default: '' },
   status: { type: String, enum: ['waiting','active','completed'], default: 'waiting' },
@@ -250,8 +250,8 @@ function verifyTgAuth(initData) {
 }
 
 // ===== Board Constants =====
-const BOARD_SIZE = 6;
-const WIN_LEN = 5;
+const BOARD_SIZE = 5;
+const WIN_LEN = 4;
 
 function checkWin(board, sym) {
   const dirs = [[0,1],[1,0],[1,1],[1,-1]];
@@ -291,7 +291,7 @@ function wouldWin(board, r, c, sym) {
   return w;
 }
 
-// ── Hard Mode Heuristic Scoring (6x6, 5-in-a-row) ──────────────────────────
+// ── Hard Mode Heuristic Scoring (5x5, 4-in-a-row) ──────────────────────────
 
 // Count consecutive sym pieces from (r,c) in direction (dr,dc), not including (r,c) itself
 function countStreak(board, r, c, dr, dc, sym) {
@@ -311,18 +311,18 @@ function isEndOpen(board, r, c, dr, dc, streak) {
 
 // Heuristic score for a line through (r,c) based on streak and openness
 function lineScore(total, openEnds) {
-  if (total >= WIN_LEN) return 100000;   // 5-in-a-row
-  if (total === 4) {
-    if (openEnds === 2) return 5000;     // Open 4 (double threat, must block!)
-    if (openEnds === 1) return 2000;     // Half-open 4
+  if (total >= WIN_LEN) return 100000;   // 4-in-a-row
+  if (total === 3) {
+    if (openEnds === 2) return 5000;     // Open 3 (double threat, must block!)
+    if (openEnds === 1) return 2000;     // Half-open 3
     return 200;
   }
-  if (total === 3) {
-    if (openEnds === 2) return 1000;     // Open 3
+  if (total === 2) {
+    if (openEnds === 2) return 1000;     // Open 2
     if (openEnds === 1) return 300;
     return 50;
   }
-  if (total === 2) {
+  if (total === 1) {
     if (openEnds === 2) return 100;
     if (openEnds === 1) return 25;
     return 5;
@@ -1255,7 +1255,7 @@ io.on('connection', (socket) => {
         return socket.emit('error',{msg:'AI စဉ်းစားနေဆဲ ဖြစ်သည်'});
       }
       if (game.currentTurn!==myUserId) return socket.emit('error',{msg:'သင့်လှည့် မဟုတ်ပါ'});
-      if (row<0||row>5||col<0||col>5) return socket.emit('error',{msg:'Invalid move'});
+      if (row<0||row>4||col<0||col>4) return socket.emit('error',{msg:'Invalid move'});
       if (game.board[row][col]!=='') return socket.emit('error',{msg:'ထိုနေရာ ယူပြီးသား'});
 
       // ── FIX A: safe symbol lookup (handles both Number & String keys) ──
