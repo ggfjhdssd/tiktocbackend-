@@ -178,6 +178,8 @@ const agentSchema = new mongoose.Schema({
   agentKpayNumber:  { type: String, default: '' },
   agentKpayName:    { type: String, default: '' },
   hasWave:          { type: Boolean, default: false },
+  agentWaveNumber:  { type: String, default: '' },
+  agentWaveName:    { type: String, default: '' },
   isActive:      { type: Boolean, default: true },
   createdAt:     { type: Date, default: Date.now }
 });
@@ -2074,6 +2076,99 @@ app.get('/api/agent/referrals', isAgent, async (req, res) => {
 });
 
 
+// ===== Agent Deposit Management =====
+
+// Get pending deposits for agent's referral users
+app.get('/api/agent/deposits', isAgent, async (req, res) => {
+  try {
+    const agentId = req.agentUser.telegramId;
+    const referredUsers = await User.find({ referredBy: agentId }).select('telegramId firstName username').lean();
+    if (!referredUsers.length) return res.json([]);
+    const referredIds = referredUsers.map(u => u.telegramId);
+    const userMap = {};
+    referredUsers.forEach(u => { userMap[u.telegramId] = u.firstName || u.username || `User${u.telegramId}`; });
+    const status = req.query.status || 'pending';
+    const deps = await Deposit.find({ userId: { $in: referredIds }, status })
+      .sort({ createdAt: -1 }).limit(50).lean();
+    res.json(deps.map(d => ({ ...d, userName: userMap[d.userId] || String(d.userId) })));
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Agent confirms deposit (deducts from agent balance, credits user)
+app.post('/api/agent/deposits/:id/confirm', isAgent, async (req, res) => {
+  try {
+    const agentId = req.agentUser.telegramId;
+    // Atomic lock
+    const dep = await Deposit.findOneAndUpdate(
+      { _id: req.params.id, status: 'pending' },
+      { $set: { status: 'confirming' } },
+      { new: false }
+    );
+    if (!dep) {
+      const existing = await Deposit.findById(req.params.id).lean();
+      if (!existing) return res.status(404).json({ error: 'မတွေ့ပါ' });
+      return res.status(400).json({ error: 'ပြင်ဆင်ပြီးသားဖြစ်သည်' });
+    }
+    // Verify belongs to agent's referral
+    const user = await User.findOne({ telegramId: dep.userId }).lean();
+    if (!user || user.referredBy !== agentId) {
+      await Deposit.findByIdAndUpdate(dep._id, { $set: { status: 'pending' } });
+      return res.status(403).json({ error: 'ဤ User သည် သင့် Referral မဟုတ်ပါ' });
+    }
+    // Check agent balance
+    const agentFresh = await User.findOne({ telegramId: agentId }).lean();
+    if (!agentFresh || agentFresh.balance < dep.amount) {
+      await Deposit.findByIdAndUpdate(dep._id, { $set: { status: 'pending' } });
+      return res.status(402).json({
+        error: `လက်ကျန်ငွေ မလောက်ပါ (ကျန်: ${(agentFresh?.balance||0).toLocaleString()} / လို: ${dep.amount.toLocaleString()} ကျပ်)\nAdmin ထံ ဆက်သွယ်ပြီး ယူနစ်ဖြည့်ပါ`,
+        insufficientBalance: true, agentBalance: agentFresh?.balance||0, required: dep.amount
+      });
+    }
+    // Finalize
+    const TTL = new Date(Date.now() + 72*60*60*1000);
+    await Deposit.findByIdAndUpdate(dep._id, { $set: { status:'confirmed', processedAt:new Date(), processedBy:'agent', expireAt:TTL } });
+    await User.findOneAndUpdate({ telegramId: agentId }, { $inc: { balance: -dep.amount } });
+    await User.findOneAndUpdate({ telegramId: dep.userId }, { $inc: { balance: dep.amount } });
+    // First deposit bonus 100 ကျပ်
+    const prevDeps = await Deposit.countDocuments({ userId: dep.userId, status:'confirmed', _id:{$ne:dep._id} });
+    if (prevDeps === 0) {
+      await User.findOneAndUpdate({ telegramId: agentId }, { $inc: { balance: 100 } });
+      if (bot) bot.telegram.sendMessage(agentId, `🎉 Referral ပထမဆုံး ငွေဖြည့် — <b>100 ကျပ်</b> ရရှိပြီ!`, { parse_mode:'HTML' }).catch(()=>{});
+    }
+    // Distribute unilevel commission
+    await distributeCommission(dep.userId, dep.amount, dep._id);
+    const methodLabel = dep.paymentMethod === 'wave' ? '🌊 Wave Pay' : '📱 KPay';
+    if (bot) bot.telegram.sendMessage(dep.userId,
+      `✅ ငွေ ${dep.amount.toLocaleString()} ကျပ် သွင်းမှု အတည်ပြုပြီး!\n${methodLabel}\n\nသင့်လက်ကျန်ငွေ ပေါင်းထည့်ပြီး 🎉`,
+      Markup.inlineKeyboard([[Markup.button.webApp('🎮 ကစားမည်', FRONTEND_URL)]])).catch(()=>{});
+    const agentName = agentFresh.firstName || agentFresh.username || `Agent${agentId}`;
+    const userName = user.firstName || user.username || `User${dep.userId}`;
+    if (bot) bot.telegram.sendMessage(ADMIN_ID,
+      `🎯 <b>Agent မှ Deposit Confirm</b>\n👤 User: ${userName} (${dep.userId})\n💰 ${dep.amount.toLocaleString()} ကျပ် (${methodLabel})\n🎯 Agent: ${agentName} (${agentId})`,
+      { parse_mode:'HTML' }).catch(()=>{});
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Agent rejects deposit
+app.post('/api/agent/deposits/:id/reject', isAgent, async (req, res) => {
+  try {
+    const agentId = req.agentUser.telegramId;
+    const { reason } = req.body;
+    const dep = await Deposit.findOneAndUpdate(
+      { _id: req.params.id, status: 'pending' },
+      { $set: { status:'rejected', processedAt:new Date(), processedBy:'agent', expireAt:new Date(Date.now()+72*60*60*1000) } },
+      { new: true }
+    );
+    if (!dep) return res.status(400).json({ error: 'မတွေ့ပါ သို့မဟုတ် ပြင်ဆင်ပြီးသားဖြစ်သည်' });
+    const user = await User.findOne({ telegramId: dep.userId }).lean();
+    if (!user || user.referredBy !== agentId) return res.status(403).json({ error: 'သင့် Referral မဟုတ်ပါ' });
+    if (bot) bot.telegram.sendMessage(dep.userId,
+      `❌ ငွေ ${dep.amount.toLocaleString()} ကျပ် သွင်းမှု ပယ်ချပြီ\nTxn: ${dep.transactionId}${reason ? '\nအကြောင်း: '+reason : ''}`).catch(()=>{});
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ===== Payment Info API (agent-specific kpay for deposit page) =====
 
 // Get payment info for a user (shows agent's kpay if referred by agent with kpay info)
@@ -2104,8 +2199,8 @@ app.get('/api/payment-info/:telegramId', async (req, res) => {
       kpayNumber: agentDoc.agentKpayNumber,
       kpayName: agentDoc.agentKpayName || '',
       hasWave: agentDoc.hasWave || false,
-      waveNumber: '',
-      waveName: '',
+      waveNumber: agentDoc.agentWaveNumber || '',
+      waveName: agentDoc.agentWaveName || '',
       isAgentPayment: true
     });
   } catch(e) { res.status(500).json({ error: e.message }); }
@@ -2115,16 +2210,14 @@ app.get('/api/payment-info/:telegramId', async (req, res) => {
 app.post('/api/admin/agents/:tid/payment-info', isAdmin, async (req, res) => {
   try {
     const tid = parseInt(req.params.tid);
-    const { kpayNumber, kpayName, hasWave } = req.body;
+    const { kpayNumber, kpayName, hasWave, waveNumber, waveName } = req.body;
     if (!kpayNumber) return res.status(400).json({ error: 'KPay နံပါတ် လိုသည်' });
-
     const agent = await Agent.findOneAndUpdate(
       { telegramId: tid },
-      { $set: { agentKpayNumber: kpayNumber, agentKpayName: kpayName || '', hasWave: !!hasWave } },
-      { new: true, upsert: false }
+      { $set: { agentKpayNumber: kpayNumber, agentKpayName: kpayName||'', hasWave:!!hasWave, agentWaveNumber:waveNumber||'', agentWaveName:waveName||'' } },
+      { new: true, upsert: true }
     );
-    if (!agent) return res.status(404).json({ error: 'Agent Data မတွေ့ပါ' });
-    res.json({ success: true, agentKpayNumber: agent.agentKpayNumber, agentKpayName: agent.agentKpayName });
+    res.json({ success: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -2197,41 +2290,33 @@ app.get('/api/admin/agent-referrals', isAdmin, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Admin: Make user an Agent
+// Admin: Make user an Agent (with KPay/Wave info required)
 app.post('/api/admin/users/:tid/make-agent', isAdmin, async (req, res) => {
   try {
     const tid = parseInt(req.params.tid);
-    const { isAgent: makeAgent } = req.body;
+    const { isAgent: makeAgent, kpayNumber, kpayName, hasWave, waveNumber, waveName } = req.body;
     const newRole = makeAgent ? 'agent' : 'user';
-    const u = await User.findOneAndUpdate(
-      { telegramId: tid },
-      { role: newRole },
-      { new: true }
-    );
+    const u = await User.findOneAndUpdate({ telegramId: tid }, { role: newRole }, { new: true });
     if (!u) return res.status(404).json({ error: 'User မတွေ့ပါ' });
 
     if (makeAgent) {
-      // Create agent record if not exists
+      if (!kpayNumber) return res.status(400).json({ error: 'KPay နံပါတ် လိုသည်' });
       await Agent.findOneAndUpdate(
         { telegramId: tid },
-        { $setOnInsert: { telegramId: tid, referralCode: u.referralCode } },
+        { $set: {
+            telegramId: tid, referralCode: u.referralCode,
+            agentKpayNumber: kpayNumber, agentKpayName: kpayName || '',
+            hasWave: !!hasWave, agentWaveNumber: waveNumber || '', agentWaveName: waveName || ''
+          }
+        },
         { upsert: true }
       );
-      if (bot) {
-        bot.telegram.sendMessage(tid,
-          `🎯 <b>Agent အဖြစ် ခွင့်ပြုပြီ!</b>\n\n🎉 မင်္ဂလာပါ Agent!\n\nBot တွင် <code>/agent</code> ရိုက်ပြီး Agent Panel ကို ဝင်ရောက်ပါ`,
-          { parse_mode: 'HTML' }
-        ).catch(() => {});
-      }
+      if (bot) bot.telegram.sendMessage(tid,
+        `🎯 <b>Agent အဖြစ် ခွင့်ပြုပြီ!</b>\n\n🎉 မင်္ဂလာပါ Agent!\n\nBot တွင် <code>/agent</code> ရိုက်ပြီး Agent Panel ဝင်ရောက်ပါ`,
+        { parse_mode: 'HTML' }).catch(()=>{});
     } else {
-      if (bot) {
-        bot.telegram.sendMessage(tid,
-          `ℹ️ သင်၏ Agent အဆင့်ကို ဖယ်ရှားပြီးပါပြီ`,
-          { parse_mode: 'HTML' }
-        ).catch(() => {});
-      }
+      if (bot) bot.telegram.sendMessage(tid, `ℹ️ သင်၏ Agent အဆင့်ကို ဖယ်ရှားပြီးပါပြီ`).catch(()=>{});
     }
-
     res.json({ success: true, role: newRole });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -2256,10 +2341,12 @@ app.get('/api/admin/agents', isAdmin, async (req, res) => {
     const enriched = await Promise.all(agents.map(async u => {
       const agentDoc = await Agent.findOne({ telegramId: u.telegramId }).lean();
       const totalReferrals = await User.countDocuments({ referredBy: u.telegramId });
+      const freshUser = await User.findOne({ telegramId: u.telegramId }).select('totalCommission todayCommission').lean();
       return {
         ...u,
         agentData: agentDoc,
-        totalReferrals
+        totalReferrals,
+        totalCommission: freshUser?.totalCommission||0
       };
     }));
 
