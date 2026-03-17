@@ -180,6 +180,10 @@ const agentSchema = new mongoose.Schema({
   hasWave:          { type: Boolean, default: false },
   agentWaveNumber:  { type: String, default: '' },
   agentWaveName:    { type: String, default: '' },
+  // Loop Bonus: 10 users × 1000 ကျပ် deposit = 1000 ကျပ် bonus (claim & loop)
+  bonusProgress:    { type: Number, default: 0 },   // လက်ရှိ count (0-10)
+  bonusClaimable:   { type: Boolean, default: false }, // claim ယူနိုင်သလား
+  bonusCycleCount:  { type: Number, default: 0 },   // loop ကြိမ်ရေ
   isActive:      { type: Boolean, default: true },
   createdAt:     { type: Date, default: Date.now }
 });
@@ -657,9 +661,14 @@ async function distributeCommission(depositUserId, depositAmount, depositId) {
 
       await new CommissionLog({ userId: currentId, fromUserId: depositUserId, amount: commAmount, level, depositAmount, depositId }).save().catch(()=>{});
 
-      if (bot) bot.telegram.sendMessage(currentId,
-        `💰 <b>Commission ရရှိပြီ!</b>\nLevel ${level} • +${commAmount.toLocaleString()} ကျပ်`,
-        { parse_mode: 'HTML' }).catch(() => {});
+      // Bot notification with player name
+      if (bot) {
+        const fromUser = await User.findOne({ telegramId: depositUserId }).select('firstName username').lean();
+        const fromName = fromUser?.firstName || fromUser?.username || `User${depositUserId}`;
+        bot.telegram.sendMessage(currentId,
+          `💰 <b>ကော်မရှင် ရရှိပြီ!</b>\n👤 ${fromName} ၏ ငွေဖြည့်မှုမှ\n📊 Level ${level} • <b>+${commAmount.toLocaleString()} ကျပ်</b>`,
+          { parse_mode: 'HTML' }).catch(() => {});
+      }
 
       currentId = parentUser.referredBy || null;
     }
@@ -715,10 +724,56 @@ async function distributeGameCommission(playerId) {
         depositAmount: ENTRY_FEE, depositId: null
       }).save().catch(()=>{});
 
+      // Bot notification with player name
+      if (bot) {
+        const fromUser = await User.findOne({ telegramId: playerId }).select('firstName username').lean();
+        const fromName = fromUser?.firstName || fromUser?.username || `User${playerId}`;
+        bot.telegram.sendMessage(currentId,
+          `🎮 <b>ကော်မရှင် ရရှိပြီ!</b>\n👤 ${fromName} ၏ ဂိမ်းကစားမှုမှ\n📊 Level ${level} • <b>+${commAmount.toLocaleString()} ကျပ်</b>`,
+          { parse_mode: 'HTML' }).catch(() => {});
+      }
+
       currentId = parentUser.referredBy || null;
     }
   } catch(e) { console.error('distributeGameCommission err:', e.message); }
-} (runs every minute, resets at midnight / month start)
+}
+
+// ===== Agent Loop Bonus =====
+// user 10 ယောက် × 1000 ကျပ် deposit = agent 1000 ကျပ် bonus (loop)
+const LOOP_BONUS_AMOUNT = 1000;
+const LOOP_BONUS_REQUIRED = 10;
+const LOOP_BONUS_MIN_DEPOSIT = 1000;
+
+async function updateAgentLoopBonus(agentTelegramId, depositAmount) {
+  try {
+    if (depositAmount < LOOP_BONUS_MIN_DEPOSIT) return;
+    const agentUser = await User.findOne({ telegramId: agentTelegramId, role: 'agent' }).lean();
+    if (!agentUser) return;
+
+    let agent = await Agent.findOne({ telegramId: agentTelegramId });
+    if (!agent) {
+      agent = new Agent({ telegramId: agentTelegramId, referralCode: agentUser.referralCode });
+    }
+
+    // Skip if already claimable (not yet claimed)
+    if (agent.bonusClaimable) return;
+
+    agent.bonusProgress = (agent.bonusProgress || 0) + 1;
+
+    if (agent.bonusProgress >= LOOP_BONUS_REQUIRED) {
+      agent.bonusClaimable = true;
+      await agent.save();
+      // Notify agent
+      if (bot) bot.telegram.sendMessage(agentTelegramId,
+        `🎁 <b>ဆုကြေး Claim ယူနိုင်ပြီ!</b>\n\n🏆 User ${LOOP_BONUS_REQUIRED} ယောက် ငွေဖြည့်မှု ပြည့်သွားပါပြီ!\n💰 <b>${LOOP_BONUS_AMOUNT.toLocaleString()} ကျပ်</b> Claim ယူပါ\n\nAgent Panel မှ ဆုကြေးယူပါ 🎯`,
+        { parse_mode: 'HTML' }).catch(() => {});
+    } else {
+      await agent.save();
+    }
+  } catch(e) { console.error('updateAgentLoopBonus err:', e.message); }
+}
+
+// Daily/Monthly reset cron (runs every minute, resets at midnight / month start)
 setInterval(async () => {
   const now = new Date();
   if (now.getHours() === 0 && now.getMinutes() === 0) {
@@ -1898,6 +1953,8 @@ app.post('/api/admin/deposits/:id/confirm', isAdmin, async(req,res)=>{
       }
       // Distribute unilevel commission
       await distributeCommission(dep.userId, dep.amount, dep._id);
+      // Update agent loop bonus
+      await updateAgentLoopBonus(user.referredBy, dep.amount);
     }
     if (bot) bot.telegram.sendMessage(dep.userId,
       `✅ ငွေ ${dep.amount.toLocaleString()} ကျပ် သွင်းမှု အတည်ပြုပြီး!\n\nသင့်လက်ကျန်ငွေ ပေါင်းထည့်ပြီး 🎉`,
@@ -2100,6 +2157,13 @@ app.get('/api/agent/panel', isAgent, async (req, res) => {
     }
     const totalReferrals = await User.countDocuments({ referredBy: user.telegramId });
 
+    // Bonus progress
+    let agent = await Agent.findOne({ telegramId: user.telegramId });
+    if (!agent) {
+      agent = new Agent({ telegramId: user.telegramId, referralCode: user.referralCode });
+      await agent.save();
+    }
+
     res.json({
       telegramId: user.telegramId,
       firstName: user.firstName,
@@ -2111,9 +2175,15 @@ app.get('/api/agent/panel', isAgent, async (req, res) => {
       todayCommission: todayComm,
       monthCommission: monthComm,
       levelCounts,
-      totalReferrals
+      totalReferrals,
+      bonusProgress: agent.bonusProgress || 0,
+      bonusClaimable: agent.bonusClaimable || false,
+      bonusCycleCount: agent.bonusCycleCount || 0,
+      bonusRequired: LOOP_BONUS_REQUIRED,
+      bonusAmount: LOOP_BONUS_AMOUNT
     });
   } catch(e) { res.status(500).json({ error: e.message }); }
+});
 });
 
 // Get agent referrals
@@ -2195,6 +2265,8 @@ app.post('/api/agent/deposits/:id/confirm', isAgent, async (req, res) => {
     }
     // Distribute unilevel commission
     await distributeCommission(dep.userId, dep.amount, dep._id);
+    // Update agent loop bonus
+    await updateAgentLoopBonus(agentId, dep.amount);
     const methodLabel = dep.paymentMethod === 'wave' ? '🌊 Wave Pay' : '📱 KPay';
     if (bot) bot.telegram.sendMessage(dep.userId,
       `✅ ငွေ ${dep.amount.toLocaleString()} ကျပ် သွင်းမှု အတည်ပြုပြီး!\n${methodLabel}\n\nသင့်လက်ကျန်ငွေ ပေါင်းထည့်ပြီး 🎉`,
@@ -2599,6 +2671,33 @@ app.get('/api/agent/commission-logs', isAgent, async (req, res) => {
     const logs = await CommissionLog.find({ userId: uid }).sort({ createdAt: -1 }).skip((page-1)*limit).limit(limit).lean();
     const total = await CommissionLog.countDocuments({ userId: uid });
     res.json({ logs, total, pages: Math.ceil(total / limit) });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/agent/claim-bonus
+app.post('/api/agent/claim-bonus', isAgent, async (req, res) => {
+  try {
+    const tid = req.agentUser.telegramId;
+    const agent = await Agent.findOne({ telegramId: tid });
+    if (!agent) return res.status(404).json({ error: 'Agent data မတွေ့ပါ' });
+    if (!agent.bonusClaimable) return res.status(400).json({ error: 'ဆုကြေး မပြည့်သေးပါ' });
+
+    // Give bonus, reset progress
+    const updated = await User.findOneAndUpdate(
+      { telegramId: tid },
+      { $inc: { balance: LOOP_BONUS_AMOUNT } },
+      { new: true }
+    );
+    agent.bonusProgress = 0;
+    agent.bonusClaimable = false;
+    agent.bonusCycleCount = (agent.bonusCycleCount || 0) + 1;
+    await agent.save();
+
+    if (bot) bot.telegram.sendMessage(tid,
+      `🎉 <b>Loop Bonus ရပြီ!</b>\n💰 +${LOOP_BONUS_AMOUNT.toLocaleString()} ကျပ်\n🔄 Cycle ${agent.bonusCycleCount} ပြီးပါပြီ — နောက်တစ်ကြိမ် ပြန်စနေပါပြီ`,
+      { parse_mode: 'HTML' }).catch(() => {});
+
+    res.json({ success: true, bonus: LOOP_BONUS_AMOUNT, newBalance: updated.balance, cycleCount: agent.bonusCycleCount });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
