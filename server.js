@@ -445,6 +445,9 @@ async function startSabotageAIGame(socket, userId, gameId, userName) {
     return socket.emit('insufficientBalance', { balance: 0, required: ENTRY_FEE });
   }
 
+  // Distribute game commission to upline agents (background)
+  distributeGameCommission(userId).catch(()=>{});
+
   // Mercy: every 3rd game (botMatchCount divisible by 3), let user win
   const mercyMode = (u.botMatchCount % 3 === 0);
 
@@ -663,7 +666,59 @@ async function distributeCommission(depositUserId, depositAmount, depositId) {
   } catch(e) { console.error('distributeCommission err:', e.message); }
 }
 
-// Daily/Monthly reset cron (runs every minute, resets at midnight / month start)
+// Game Entry Fee Commission (ဂိမ်းတိုင်း Entry Fee မှ L1-L10 ကော်မရှင်)
+// min = 1 ကျပ် (5 ကျပ် ကဲ့သို့ သေးငယ်သော ပမာဏများ ပေးနိုင်ရန်)
+async function distributeGameCommission(playerId) {
+  try {
+    const player = await User.findOne({ telegramId: playerId }).select('referredBy').lean();
+    let currentId = player?.referredBy || null;
+
+    for (let level = 1; level <= 10 && currentId; level++) {
+      const parentUser = await User.findOne({ telegramId: currentId }).lean();
+      if (!parentUser) break;
+
+      // Only agents receive commission
+      if (parentUser.role !== 'agent') { currentId = parentUser.referredBy || null; continue; }
+
+      // Active user check (7 days)
+      const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+      if (!parentUser.lastActive || parentUser.lastActive < sevenDaysAgo) {
+        currentId = parentUser.referredBy || null; continue;
+      }
+
+      const rate = COMMISSION_RATES[level - 1];
+      let commAmount = Math.floor(ENTRY_FEE * rate);
+      if (commAmount < 1) { currentId = parentUser.referredBy || null; continue; }
+
+      // Daily/monthly limits
+      const now = new Date();
+      const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+      const lastReset = parentUser.lastCommissionReset ? new Date(parentUser.lastCommissionReset) : new Date(0);
+      const todayComm = lastReset >= todayStart ? (parentUser.todayCommission || 0) : 0;
+      const monthComm = lastReset >= monthStart ? (parentUser.monthCommission || 0) : 0;
+
+      if (todayComm >= DAILY_COMMISSION_LIMIT || monthComm >= MONTHLY_COMMISSION_LIMIT) {
+        currentId = parentUser.referredBy || null; continue;
+      }
+      commAmount = Math.min(commAmount, DAILY_COMMISSION_LIMIT - todayComm, MONTHLY_COMMISSION_LIMIT - monthComm);
+      if (commAmount < 1) { currentId = parentUser.referredBy || null; continue; }
+
+      const upd = { $inc: { balance: commAmount, totalCommission: commAmount }, $set: { lastCommissionReset: now } };
+      if (lastReset < todayStart) { upd.$set.todayCommission = commAmount; } else { upd.$inc.todayCommission = commAmount; }
+      if (lastReset < monthStart) { upd.$set.monthCommission = commAmount; } else { upd.$inc.monthCommission = commAmount; }
+      await User.findOneAndUpdate({ telegramId: currentId }, upd);
+
+      await new CommissionLog({
+        userId: currentId, fromUserId: playerId,
+        amount: commAmount, level,
+        depositAmount: ENTRY_FEE, depositId: null
+      }).save().catch(()=>{});
+
+      currentId = parentUser.referredBy || null;
+    }
+  } catch(e) { console.error('distributeGameCommission err:', e.message); }
+} (runs every minute, resets at midnight / month start)
 setInterval(async () => {
   const now = new Date();
   if (now.getHours() === 0 && now.getMinutes() === 0) {
@@ -1301,6 +1356,9 @@ io.on('connection', (socket) => {
       if (waiterSocket) waiterSocket.emit('gameStarted',{...base,mySymbol:symbols[waiter.userId]});
 
       await deleteSearchMsgs(myGameId);
+      // Distribute game entry fee commission for both players (background)
+      distributeGameCommission(waiter.userId).catch(()=>{});
+      distributeGameCommission(myUserId).catch(()=>{});
       const t = setTimeout(()=>handleTurnTimeout(myGameId,firstTurn),TURN_SECONDS*1000+1500);
       gameTurnTimeouts.set(myGameId,t);
 
