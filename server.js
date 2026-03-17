@@ -628,13 +628,6 @@ async function distributeCommission(depositUserId, depositAmount, depositId) {
         continue;
       }
 
-      // Active user check (7 days)
-      const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-      if (!parentUser.lastActive || parentUser.lastActive < sevenDaysAgo) {
-        currentId = parentUser.referredBy || null;
-        continue;
-      }
-
       const rate = COMMISSION_RATES[level - 1];
       let commAmount = Math.floor(depositAmount * rate);
       if (commAmount < MIN_COMMISSION) { currentId = parentUser.referredBy || null; continue; }
@@ -661,14 +654,10 @@ async function distributeCommission(depositUserId, depositAmount, depositId) {
 
       await new CommissionLog({ userId: currentId, fromUserId: depositUserId, amount: commAmount, level, depositAmount, depositId }).save().catch(()=>{});
 
-      // Bot notification with player name
-      if (bot) {
-        const fromUser = await User.findOne({ telegramId: depositUserId }).select('firstName username').lean();
-        const fromName = fromUser?.firstName || fromUser?.username || `User${depositUserId}`;
-        bot.telegram.sendMessage(currentId,
-          `💰 <b>ကော်မရှင် ရရှိပြီ!</b>\n👤 ${fromName} ၏ ငွေဖြည့်မှုမှ\n📊 Level ${level} • <b>+${commAmount.toLocaleString()} ကျပ်</b>`,
-          { parse_mode: 'HTML' }).catch(() => {});
-      }
+      // Bot notification — fire and forget
+      if (bot) bot.telegram.sendMessage(currentId,
+        `💰 <b>ကော်မရှင် ရရှိပြီ!</b>\n👤 User${depositUserId} ငွေဖြည့်မှုမှ\n📊 Level ${level} • <b>+${commAmount.toLocaleString()} ကျပ်</b>`,
+        { parse_mode: 'HTML' }).catch(() => {});
 
       currentId = parentUser.referredBy || null;
     }
@@ -679,21 +668,18 @@ async function distributeCommission(depositUserId, depositAmount, depositId) {
 // min = 1 ကျပ် (5 ကျပ် ကဲ့သို့ သေးငယ်သော ပမာဏများ ပေးနိုင်ရန်)
 async function distributeGameCommission(playerId) {
   try {
-    const player = await User.findOne({ telegramId: playerId }).select('referredBy').lean();
-    let currentId = player?.referredBy || null;
+    const fromUser = await User.findOne({ telegramId: playerId }).select('referredBy firstName username').lean();
+    if (!fromUser?.referredBy) return;
+    const fromName = fromUser.firstName || fromUser.username || `User${playerId}`;
+
+    let currentId = fromUser.referredBy;
 
     for (let level = 1; level <= 10 && currentId; level++) {
       const parentUser = await User.findOne({ telegramId: currentId }).lean();
       if (!parentUser) break;
 
-      // Only agents receive commission
+      // Only agents receive game commission
       if (parentUser.role !== 'agent') { currentId = parentUser.referredBy || null; continue; }
-
-      // Active user check (7 days)
-      const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-      if (!parentUser.lastActive || parentUser.lastActive < sevenDaysAgo) {
-        currentId = parentUser.referredBy || null; continue;
-      }
 
       const rate = COMMISSION_RATES[level - 1];
       let commAmount = Math.floor(ENTRY_FEE * rate);
@@ -718,20 +704,17 @@ async function distributeGameCommission(playerId) {
       if (lastReset < monthStart) { upd.$set.monthCommission = commAmount; } else { upd.$inc.monthCommission = commAmount; }
       await User.findOneAndUpdate({ telegramId: currentId }, upd);
 
-      await new CommissionLog({
+      new CommissionLog({
         userId: currentId, fromUserId: playerId,
-        amount: commAmount, level,
-        depositAmount: ENTRY_FEE, depositId: null
+        amount: commAmount, level, depositAmount: ENTRY_FEE, depositId: null
       }).save().catch(()=>{});
 
-      // Bot notification with player name
-      if (bot) {
-        const fromUser = await User.findOne({ telegramId: playerId }).select('firstName username').lean();
-        const fromName = fromUser?.firstName || fromUser?.username || `User${playerId}`;
-        bot.telegram.sendMessage(currentId,
-          `🎮 <b>ကော်မရှင် ရရှိပြီ!</b>\n👤 ${fromName} ၏ ဂိမ်းကစားမှုမှ\n📊 Level ${level} • <b>+${commAmount.toLocaleString()} ကျပ်</b>`,
-          { parse_mode: 'HTML' }).catch(() => {});
-      }
+      // Bot notification — fire and forget
+      if (bot) bot.telegram.sendMessage(currentId,
+        `🎮 <b>ကော်မရှင် ရရှိပြီ!</b>
+👤 ${fromName} ကစားမှုမှ
+📊 Level ${level} • <b>+${commAmount.toLocaleString()} ကျပ်</b>`,
+        { parse_mode: 'HTML' }).catch(() => {});
 
       currentId = parentUser.referredBy || null;
     }
