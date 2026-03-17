@@ -32,14 +32,8 @@ const FRONTEND_URL = process.env.FRONTEND_URL || 'https://tictokfrontend.vercel.
 const BACKEND_URL = process.env.BACKEND_URL || 'https://tiktocbackend-zktq.onrender.com';
 const BOT_USERNAME = process.env.BOT_USERNAME || 'tictoe1_bot';
 const ENTRY_FEE = 500;
-const WIN_PRIZE = 800;
-const DRAW_REFUND = 400;
-
-// ===== Unilevel Commission Config =====
-const COMMISSION_RATES = [0.01, 0.005, 0.0025, 0.00125, 0.000625, 0.0003125, 0.00015625, 0.000078125, 0.0000390625, 0.00001953125];
-const DAILY_COMMISSION_LIMIT = 100000;
-const MONTHLY_COMMISSION_LIMIT = 1000000;
-const MIN_COMMISSION = 100;
+const WIN_PRIZE = 900;
+const DRAW_REFUND = 450;
 const TURN_SECONDS = 10;
 const SEARCH_TIMEOUT_S = 60;
 
@@ -66,15 +60,15 @@ connectDB();
 async function seedAgentPaymentInfo() {
   try {
     const agentUser = await User.findOne({ referralCode: 'TIC3W2ZCO6CXBK', role: 'agent' }).lean();
-    if (!agentUser) return;
+    if (!agentUser) return; // agent not yet registered
     const existing = await Agent.findOne({ telegramId: agentUser.telegramId }).lean();
-    if (existing && existing.agentKpayNumber === '09781317607') return;
+    if (existing && existing.agentKpayNumber === '09781317607') return; // already seeded
     await Agent.findOneAndUpdate(
       { telegramId: agentUser.telegramId },
       { $set: { agentKpayNumber: '09781317607', agentKpayName: 'Nang pauk', hasWave: false } },
-      { upsert: true }
+      { upsert: false }
     );
-    console.log('✅ Seeded Nang pauk kpay info');
+    console.log('✅ Seeded Nang pauk kpay info for agent TIC3W2ZCO6CXBK');
   } catch(e) { console.error('seedAgentPaymentInfo err:', e.message); }
 }
 setTimeout(seedAgentPaymentInfo, 5000); // run after DB connects
@@ -95,18 +89,7 @@ const userSchema = new mongoose.Schema({
   botMode: { type: Boolean, default: false },
   botMatchCount: { type: Number, default: 0 },
   lastActive: { type: Date, default: Date.now },
-  createdAt: { type: Date, default: Date.now },
-  // Unilevel Commission fields
-  downlineLevels: {
-    level1: [{ type: Number }], level2: [{ type: Number }], level3: [{ type: Number }],
-    level4: [{ type: Number }], level5: [{ type: Number }], level6: [{ type: Number }],
-    level7: [{ type: Number }], level8: [{ type: Number }], level9: [{ type: Number }],
-    level10: [{ type: Number }]
-  },
-  totalCommission: { type: Number, default: 0 },
-  todayCommission: { type: Number, default: 0 },
-  monthCommission: { type: Number, default: 0 },
-  lastCommissionReset: { type: Date, default: Date.now }
+  createdAt: { type: Date, default: Date.now }
 });
 userSchema.index({ telegramId: 1 });
 userSchema.index({ referralCode: 1 });
@@ -171,35 +154,46 @@ const redeemCodeSchema = new mongoose.Schema({
 });
 redeemCodeSchema.index({ code: 1 });
 
-// ===== Agent Schema (Box system removed — Unilevel Commission only) =====
+// ===== Agent Schema =====
 const agentSchema = new mongoose.Schema({
   telegramId:    { type: Number, required: true, unique: true },
-  referralCode:  { type: String },
-  agentKpayNumber:  { type: String, default: '' },
-  agentKpayName:    { type: String, default: '' },
-  hasWave:          { type: Boolean, default: false },
-  agentWaveNumber:  { type: String, default: '' },
-  agentWaveName:    { type: String, default: '' },
-  // Loop Bonus: 10 users × 1000 ကျပ် deposit = 1000 ကျပ် bonus (claim & loop)
-  bonusProgress:    { type: Number, default: 0 },   // လက်ရှိ count (0-10)
-  bonusClaimable:   { type: Boolean, default: false }, // claim ယူနိုင်သလား
-  bonusCycleCount:  { type: Number, default: 0 },   // loop ကြိမ်ရေ
+  referralCode:  { type: String },           // same as User.referralCode
+  // Agent-specific payment info (shown to users on deposit page)
+  agentKpayNumber:  { type: String, default: '' },  // e.g. 09781317607
+  agentKpayName:    { type: String, default: '' },  // e.g. Nang pauk
+  hasWave:          { type: Boolean, default: false }, // hide Wave if false
+  milestones: {
+    // box1..box10: { current, claimed, lastReset(for loop) }
+    1:  { current:{type:Number,default:0}, claimed:{type:Boolean,default:false} },
+    2:  { current:{type:Number,default:0}, claimed:{type:Boolean,default:false} },
+    3:  { current:{type:Number,default:0}, claimed:{type:Boolean,default:false} },
+    4:  { current:{type:Number,default:0}, claimed:{type:Boolean,default:false} },
+    5:  { current:{type:Number,default:0}, claimed:{type:Boolean,default:false} },
+    6:  { current:{type:Number,default:0}, claimed:{type:Boolean,default:false} },
+    7:  { current:{type:Number,default:0}, claimed:{type:Boolean,default:false} },
+    8:  { current:{type:Number,default:0}, claimed:{type:Boolean,default:false} },
+    9:  { current:{type:Number,default:0}, claimed:{type:Boolean,default:false} },
+    10: { current:{type:Number,default:0}, claimed:{type:Boolean,default:false} }
+  },
+  totalEarned:   { type: Number, default: 0 },
+  completedBoxes:{ type: Number, default: 0 },
   isActive:      { type: Boolean, default: true },
   createdAt:     { type: Date, default: Date.now }
 });
 agentSchema.index({ telegramId: 1 });
 
-// ===== Commission Log Schema =====
-const commissionLogSchema = new mongoose.Schema({
-  userId: { type: Number, required: true },
-  fromUserId: { type: Number, required: true },
-  amount: { type: Number, required: true },
-  level: { type: Number, required: true },
-  depositAmount: { type: Number, required: true },
-  depositId: { type: mongoose.Schema.Types.ObjectId, ref: 'Deposit' },
-  createdAt: { type: Date, default: Date.now }
-});
-commissionLogSchema.index({ userId: 1, createdAt: -1 });
+const BOX_CONFIG = [
+  { box:1, people:5,   perPerson:1000,  bonus:500      },
+  { box:2, people:10,  perPerson:2000,  bonus:2000     },
+  { box:3, people:30,  perPerson:3000,  bonus:10000    },
+  { box:4, people:50,  perPerson:5000,  bonus:30000    },
+  { box:5, people:70,  perPerson:10000, bonus:80000    },  // corrected from screenshot
+  { box:6, people:100, perPerson:20000, bonus:300000   },
+  { box:7, people:150, perPerson:30000, bonus:800000   },
+  { box:8, people:200, perPerson:50000, bonus:2000000  },
+  { box:9, people:70,  perPerson:70000, bonus:1000000  },
+  { box:10,people:10,  perPerson:2000,  bonus:2000,    loop:true }
+];
 
 const User = mongoose.model('User', userSchema);
 const Deposit = mongoose.model('Deposit', depositSchema);
@@ -208,7 +202,6 @@ const Game = mongoose.model('Game', gameSchema);
 const Settings = mongoose.model('Settings', settingsSchema);
 const RedeemCode = mongoose.model('RedeemCode', redeemCodeSchema);
 const Agent = mongoose.model('Agent', agentSchema);
-const CommissionLog = mongoose.model('CommissionLog', commissionLogSchema);
 
 // ===== In-Memory =====
 const waitingQueue = [];
@@ -449,9 +442,6 @@ async function startSabotageAIGame(socket, userId, gameId, userName) {
     return socket.emit('insufficientBalance', { balance: 0, required: ENTRY_FEE });
   }
 
-  // Distribute game commission to upline agents (background)
-  distributeGameCommission(userId).catch(()=>{});
-
   // Mercy: every 3rd game (botMatchCount divisible by 3), let user win
   const mercyMode = (u.botMatchCount % 3 === 0);
 
@@ -589,184 +579,6 @@ async function handleSabotage(game, userId) {
   }, delayMs);
 }
 
-// ===== Unilevel Commission Functions =====
-
-async function checkIfUserActive(userId) {
-  try {
-    const user = await User.findOne({ telegramId: userId }).select('lastActive').lean();
-    if (!user) return false;
-    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-    return user.lastActive >= sevenDaysAgo;
-  } catch { return false; }
-}
-
-async function updateReferralChain(newUserId, referrerId) {
-  try {
-    let currentId = referrerId;
-    for (let level = 1; level <= 10; level++) {
-      if (!currentId) break;
-      const levelKey = `downlineLevels.level${level}`;
-      await User.findOneAndUpdate({ telegramId: currentId }, { $addToSet: { [levelKey]: newUserId } });
-      const parent = await User.findOne({ telegramId: currentId }).select('referredBy').lean();
-      currentId = parent?.referredBy || null;
-    }
-  } catch(e) { console.error('updateReferralChain err:', e.message); }
-}
-
-async function distributeCommission(depositUserId, depositAmount, depositId) {
-  try {
-    const depositor = await User.findOne({ telegramId: depositUserId }).select('referredBy').lean();
-    let currentId = depositor?.referredBy || null;
-
-    for (let level = 1; level <= 10 && currentId; level++) {
-      const parentUser = await User.findOne({ telegramId: currentId }).lean();
-      if (!parentUser) break;
-
-      // Only agents receive commission
-      if (parentUser.role !== 'agent') {
-        currentId = parentUser.referredBy || null;
-        continue;
-      }
-
-      const rate = COMMISSION_RATES[level - 1];
-      let commAmount = Math.floor(depositAmount * rate);
-      if (commAmount < MIN_COMMISSION) { currentId = parentUser.referredBy || null; continue; }
-
-      // Daily/monthly reset detection
-      const now = new Date();
-      const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-      const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-      const lastReset = parentUser.lastCommissionReset ? new Date(parentUser.lastCommissionReset) : new Date(0);
-      const todayComm = lastReset >= todayStart ? (parentUser.todayCommission || 0) : 0;
-      const monthComm = lastReset >= monthStart ? (parentUser.monthCommission || 0) : 0;
-
-      if (todayComm >= DAILY_COMMISSION_LIMIT || monthComm >= MONTHLY_COMMISSION_LIMIT) {
-        currentId = parentUser.referredBy || null; continue;
-      }
-      commAmount = Math.min(commAmount, DAILY_COMMISSION_LIMIT - todayComm, MONTHLY_COMMISSION_LIMIT - monthComm);
-      if (commAmount < MIN_COMMISSION) { currentId = parentUser.referredBy || null; continue; }
-
-      // Build atomic update
-      const upd = { $inc: { balance: commAmount, totalCommission: commAmount }, $set: { lastCommissionReset: now } };
-      if (lastReset < todayStart) { upd.$set.todayCommission = commAmount; } else { upd.$inc.todayCommission = commAmount; }
-      if (lastReset < monthStart) { upd.$set.monthCommission = commAmount; } else { upd.$inc.monthCommission = commAmount; }
-      await User.findOneAndUpdate({ telegramId: currentId }, upd);
-
-      await new CommissionLog({ userId: currentId, fromUserId: depositUserId, amount: commAmount, level, depositAmount, depositId }).save().catch(()=>{});
-
-      // Bot notification — fire and forget
-      if (bot) bot.telegram.sendMessage(currentId,
-        `💰 <b>ကော်မရှင် ရရှိပြီ!</b>\n👤 User${depositUserId} ငွေဖြည့်မှုမှ\n📊 Level ${level} • <b>+${commAmount.toLocaleString()} ကျပ်</b>`,
-        { parse_mode: 'HTML' }).catch(() => {});
-
-      currentId = parentUser.referredBy || null;
-    }
-  } catch(e) { console.error('distributeCommission err:', e.message); }
-}
-
-// Game Entry Fee Commission (ဂိမ်းတိုင်း Entry Fee မှ L1-L10 ကော်မရှင်)
-// min = 1 ကျပ် (5 ကျပ် ကဲ့သို့ သေးငယ်သော ပမာဏများ ပေးနိုင်ရန်)
-async function distributeGameCommission(playerId) {
-  try {
-    const fromUser = await User.findOne({ telegramId: playerId }).select('referredBy firstName username').lean();
-    if (!fromUser?.referredBy) return;
-    const fromName = fromUser.firstName || fromUser.username || `User${playerId}`;
-
-    let currentId = fromUser.referredBy;
-
-    for (let level = 1; level <= 10 && currentId; level++) {
-      const parentUser = await User.findOne({ telegramId: currentId }).lean();
-      if (!parentUser) break;
-
-      // Only agents receive game commission
-      if (parentUser.role !== 'agent') { currentId = parentUser.referredBy || null; continue; }
-
-      const rate = COMMISSION_RATES[level - 1];
-      let commAmount = Math.floor(ENTRY_FEE * rate);
-      if (commAmount < 1) { currentId = parentUser.referredBy || null; continue; }
-
-      // Daily/monthly limits
-      const now = new Date();
-      const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-      const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-      const lastReset = parentUser.lastCommissionReset ? new Date(parentUser.lastCommissionReset) : new Date(0);
-      const todayComm = lastReset >= todayStart ? (parentUser.todayCommission || 0) : 0;
-      const monthComm = lastReset >= monthStart ? (parentUser.monthCommission || 0) : 0;
-
-      if (todayComm >= DAILY_COMMISSION_LIMIT || monthComm >= MONTHLY_COMMISSION_LIMIT) {
-        currentId = parentUser.referredBy || null; continue;
-      }
-      commAmount = Math.min(commAmount, DAILY_COMMISSION_LIMIT - todayComm, MONTHLY_COMMISSION_LIMIT - monthComm);
-      if (commAmount < 1) { currentId = parentUser.referredBy || null; continue; }
-
-      const upd = { $inc: { balance: commAmount, totalCommission: commAmount }, $set: { lastCommissionReset: now } };
-      if (lastReset < todayStart) { upd.$set.todayCommission = commAmount; } else { upd.$inc.todayCommission = commAmount; }
-      if (lastReset < monthStart) { upd.$set.monthCommission = commAmount; } else { upd.$inc.monthCommission = commAmount; }
-      await User.findOneAndUpdate({ telegramId: currentId }, upd);
-
-      new CommissionLog({
-        userId: currentId, fromUserId: playerId,
-        amount: commAmount, level, depositAmount: ENTRY_FEE, depositId: null
-      }).save().catch(()=>{});
-
-      // Bot notification — fire and forget
-      if (bot) bot.telegram.sendMessage(currentId,
-        `🎮 <b>ကော်မရှင် ရရှိပြီ!</b>
-👤 ${fromName} ကစားမှုမှ
-📊 Level ${level} • <b>+${commAmount.toLocaleString()} ကျပ်</b>`,
-        { parse_mode: 'HTML' }).catch(() => {});
-
-      currentId = parentUser.referredBy || null;
-    }
-  } catch(e) { console.error('distributeGameCommission err:', e.message); }
-}
-
-// ===== Agent Loop Bonus =====
-// user 10 ယောက် × 1000 ကျပ် deposit = agent 1000 ကျပ် bonus (loop)
-const LOOP_BONUS_AMOUNT = 1000;
-const LOOP_BONUS_REQUIRED = 10;
-const LOOP_BONUS_MIN_DEPOSIT = 1000;
-
-async function updateAgentLoopBonus(agentTelegramId, depositAmount) {
-  try {
-    if (depositAmount < LOOP_BONUS_MIN_DEPOSIT) return;
-    const agentUser = await User.findOne({ telegramId: agentTelegramId, role: 'agent' }).lean();
-    if (!agentUser) return;
-
-    let agent = await Agent.findOne({ telegramId: agentTelegramId });
-    if (!agent) {
-      agent = new Agent({ telegramId: agentTelegramId, referralCode: agentUser.referralCode });
-    }
-
-    // Skip if already claimable (not yet claimed)
-    if (agent.bonusClaimable) return;
-
-    agent.bonusProgress = (agent.bonusProgress || 0) + 1;
-
-    if (agent.bonusProgress >= LOOP_BONUS_REQUIRED) {
-      agent.bonusClaimable = true;
-      await agent.save();
-      // Notify agent
-      if (bot) bot.telegram.sendMessage(agentTelegramId,
-        `🎁 <b>ဆုကြေး Claim ယူနိုင်ပြီ!</b>\n\n🏆 User ${LOOP_BONUS_REQUIRED} ယောက် ငွေဖြည့်မှု ပြည့်သွားပါပြီ!\n💰 <b>${LOOP_BONUS_AMOUNT.toLocaleString()} ကျပ်</b> Claim ယူပါ\n\nAgent Panel မှ ဆုကြေးယူပါ 🎯`,
-        { parse_mode: 'HTML' }).catch(() => {});
-    } else {
-      await agent.save();
-    }
-  } catch(e) { console.error('updateAgentLoopBonus err:', e.message); }
-}
-
-// Daily/Monthly reset cron (runs every minute, resets at midnight / month start)
-setInterval(async () => {
-  const now = new Date();
-  if (now.getHours() === 0 && now.getMinutes() === 0) {
-    await User.updateMany({}, { $set: { todayCommission: 0 } }).catch(()=>{});
-    if (now.getDate() === 1) {
-      await User.updateMany({}, { $set: { monthCommission: 0 } }).catch(()=>{});
-    }
-  }
-}, 60000);
-
 // ===== Settings Helpers =====
 async function getSetting(key, def) {
   try { const s=await Settings.findOne({key}).lean(); return s?s.value:def; } catch { return def; }
@@ -815,16 +627,9 @@ if (BOT_TOKEN) {
         });
         if (args && args.length > 3) {
           const ref = await User.findOne({ referralCode: args }).lean();
-          if (ref && ref.telegramId !== id) {
-            user.referredBy = ref.telegramId;
-            await user.save();
-            await updateReferralChain(id, ref.telegramId);
-          } else {
-            await user.save();
-          }
-        } else {
-          await user.save();
+          if (ref && ref.telegramId !== id) user.referredBy = ref.telegramId;
         }
+        await user.save();
       }
 
       const isMember = await isChannelMember(id);
@@ -1394,9 +1199,6 @@ io.on('connection', (socket) => {
       if (waiterSocket) waiterSocket.emit('gameStarted',{...base,mySymbol:symbols[waiter.userId]});
 
       await deleteSearchMsgs(myGameId);
-      // Distribute game entry fee commission for both players (background)
-      distributeGameCommission(waiter.userId).catch(()=>{});
-      distributeGameCommission(myUserId).catch(()=>{});
       const t = setTimeout(()=>handleTurnTimeout(myGameId,firstTurn),TURN_SECONDS*1000+1500);
       gameTurnTimeouts.set(myGameId,t);
 
@@ -1630,6 +1432,37 @@ app.post('/api/admin/verify', async(req,res)=>{
   } catch(e){ res.status(500).json({error:'Server error'}); }
 });
 
+// ===== Agent Milestone Helper =====
+async function updateAgentMilestone(agentTelegramId, depositAmount) {
+  try {
+    const agentUser = await User.findOne({ telegramId: agentTelegramId, role: 'agent' }).lean();
+    if (!agentUser) return;
+
+    let agent = await Agent.findOne({ telegramId: agentTelegramId });
+    if (!agent) {
+      agent = new Agent({ telegramId: agentTelegramId, referralCode: agentUser.referralCode });
+      await agent.save();
+    }
+
+    // Update each box's milestone progress based on deposit amount
+    for (const cfg of BOX_CONFIG) {
+      const ms = agent.milestones[cfg.box];
+      if (!ms || ms.claimed) continue;
+      // For loop box (10), reset if claimed
+      if (cfg.loop) {
+        // Already reset logic is in claim
+      }
+      // Check if this deposit meets the per-person threshold for this box
+      if (depositAmount >= cfg.perPerson) {
+        if (ms.current < cfg.people) {
+          agent.milestones[cfg.box].current = ms.current + 1;
+        }
+      }
+    }
+    await agent.save();
+  } catch(e) { console.error('agentMilestone err:', e); }
+}
+
 // ===== Routes =====
 app.get('/', (_,res)=>res.json({ok:true}));
 app.get('/health', (_,res)=>res.json({
@@ -1672,10 +1505,7 @@ app.post('/api/auth', async(req,res)=>{
       totalGames:user.totalGames,
       wins:user.wins,
       losses:user.losses,
-      botMode:user.botMode,
-      totalCommission:user.totalCommission||0,
-      todayCommission:user.todayCommission||0,
-      role:user.role||'user'
+      botMode:user.botMode
     });
   } catch(e){ console.error(e); res.status(500).json({error:'Server error'}); }
 });
@@ -1724,16 +1554,6 @@ app.post('/api/withdraw', async(req,res)=>{
     if (!chk) return res.status(404).json({error:'User မတွေ့ပါ'});
     if (chk.isBanned===true) return res.status(403).json({error:'🚫 ကောင်ပိတ်ဆို့ထားသည်'});
     if (chk.balance<amt) return res.status(400).json({error:`လက်ကျန်ငွေ မလုံလောက်ပါ (ကျန်: ${chk.balance.toLocaleString()} MMK)`});
-
-    // 24h holding period check
-    const recentDep = await Deposit.findOne({
-      userId: tid, status: 'confirmed',
-      processedAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) }
-    }).lean();
-    if (recentDep) {
-      const remaining = Math.ceil((new Date(recentDep.processedAt).getTime() + 24*60*60*1000 - Date.now()) / (1000*60*60));
-      return res.status(400).json({error:`ငွေဖြည့်ပြီး ၂၄ နာရီ မစောင့်ရသေးပါ (${remaining} နာရီ ကျန်ပါသည်)`});
-    }
 
     const method = (paymentMethod === 'wave') ? 'wave' : 'kpay';
     const methodLabel = method === 'wave' ? '🌊 Wave Pay' : '📱 KPay';
@@ -1934,10 +1754,8 @@ app.post('/api/admin/deposits/:id/confirm', isAdmin, async(req,res)=>{
           `🎉 သင့် referral မှ ငွေဖြည့်သောကြောင့် <b>100 MMK</b> ရရှိပါပြီ!`,
           {parse_mode:'HTML'}).catch(()=>{});
       }
-      // Distribute unilevel commission
-      await distributeCommission(dep.userId, dep.amount, dep._id);
-      // Update agent loop bonus
-      await updateAgentLoopBonus(user.referredBy, dep.amount);
+      // Agent milestone update
+      await updateAgentMilestone(user.referredBy, dep.amount);
     }
     if (bot) bot.telegram.sendMessage(dep.userId,
       `✅ ငွေ ${dep.amount.toLocaleString()} ကျပ် သွင်းမှု အတည်ပြုပြီး!\n\nသင့်လက်ကျန်ငွေ ပေါင်းထည့်ပြီး 🎉`,
@@ -2125,48 +1943,37 @@ async function isAgent(req, res, next) {
 app.get('/api/agent/panel', isAgent, async (req, res) => {
   try {
     const user = req.agentUser;
-    const freshUser = await User.findOne({ telegramId: user.telegramId }).lean();
-
-    const now = new Date();
-    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-    const lastReset = freshUser.lastCommissionReset ? new Date(freshUser.lastCommissionReset) : new Date(0);
-    const todayComm = lastReset >= todayStart ? (freshUser.todayCommission || 0) : 0;
-    const monthComm = lastReset >= monthStart ? (freshUser.monthCommission || 0) : 0;
-
-    const levelCounts = {};
-    for (let i = 1; i <= 10; i++) {
-      levelCounts[`level${i}`] = (freshUser.downlineLevels?.[`level${i}`] || []).length;
-    }
-    const totalReferrals = await User.countDocuments({ referredBy: user.telegramId });
-
-    // Bonus progress
     let agent = await Agent.findOne({ telegramId: user.telegramId });
     if (!agent) {
       agent = new Agent({ telegramId: user.telegramId, referralCode: user.referralCode });
       await agent.save();
     }
+    const totalReferrals = await User.countDocuments({ referredBy: user.telegramId });
+
+    // Total Sales: sum of all confirmed deposits from agent's referral users
+    const referredIds = (await User.find({ referredBy: user.telegramId }).select('telegramId').lean()).map(u => u.telegramId);
+    const salesAgg = referredIds.length
+      ? await Deposit.aggregate([
+          { $match: { userId: { $in: referredIds }, status: 'confirmed' } },
+          { $group: { _id: null, total: { $sum: '$amount' } } }
+        ])
+      : [];
+    const totalSales = salesAgg[0]?.total || 0;
 
     res.json({
       telegramId: user.telegramId,
       firstName: user.firstName,
       username: user.username,
-      balance: freshUser.balance,
+      balance: user.balance,
       referralCode: user.referralCode,
       botUsername: BOT_USERNAME,
-      totalCommission: freshUser.totalCommission || 0,
-      todayCommission: todayComm,
-      monthCommission: monthComm,
-      levelCounts,
+      milestones: agent.milestones,
+      totalEarned: agent.totalEarned,
+      completedBoxes: agent.completedBoxes,
       totalReferrals,
-      bonusProgress: agent.bonusProgress || 0,
-      bonusClaimable: agent.bonusClaimable || false,
-      bonusCycleCount: agent.bonusCycleCount || 0,
-      bonusRequired: LOOP_BONUS_REQUIRED,
-      bonusAmount: LOOP_BONUS_AMOUNT
+      totalSales
     });
   } catch(e) { res.status(500).json({ error: e.message }); }
-});
 });
 
 // Get agent referrals
@@ -2186,123 +1993,202 @@ app.get('/api/agent/referrals', isAgent, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// Claim box bonus
+app.post('/api/agent/claim-box', isAgent, async (req, res) => {
+  try {
+    const { box } = req.body;
+    const boxNum = parseInt(box);
+    if (!boxNum || boxNum < 1 || boxNum > 10) return res.status(400).json({ error: 'Box နံပါတ် မမှန်ပါ' });
 
-// ===== Agent Deposit Management =====
+    const cfg = BOX_CONFIG.find(b => b.box === boxNum);
+    if (!cfg) return res.status(400).json({ error: 'Box မတွေ့ပါ' });
+
+    const user = req.agentUser;
+    let agent = await Agent.findOne({ telegramId: user.telegramId });
+    if (!agent) return res.status(404).json({ error: 'Agent Data မတွေ့ပါ' });
+
+    const ms = agent.milestones[boxNum];
+    if (!ms) return res.status(400).json({ error: 'Milestone မတွေ့ပါ' });
+
+    // Check unlock condition for box 10
+    if (boxNum === 10) {
+      const box2 = agent.milestones[2];
+      if (!box2?.claimed) return res.status(400).json({ error: 'Box 2 အောင်မြင်မှ Box 10 ယူနိုင်မည်' });
+    }
+
+    if (ms.current < cfg.people) {
+      return res.status(400).json({ error: `လူဦးရေ မပြည့်သေးပါ (${ms.current}/${cfg.people})` });
+    }
+
+    if (!cfg.loop && ms.claimed) {
+      return res.status(400).json({ error: 'ဆုကြေး ယူပြီးသည်' });
+    }
+
+    // Give bonus
+    const updated = await User.findOneAndUpdate(
+      { telegramId: user.telegramId },
+      { $inc: { balance: cfg.bonus } },
+      { new: true }
+    );
+
+    // Update milestone
+    if (cfg.loop) {
+      // Reset for next cycle
+      agent.milestones[boxNum].current = 0;
+      agent.milestones[boxNum].claimed = false;
+    } else {
+      agent.milestones[boxNum].claimed = true;
+      agent.completedBoxes = (agent.completedBoxes || 0) + 1;
+    }
+    agent.totalEarned = (agent.totalEarned || 0) + cfg.bonus;
+    await agent.save();
+
+    // Notify agent via bot
+    if (bot) {
+      bot.telegram.sendMessage(user.telegramId,
+        `🎉 <b>Box ${boxNum} ဆုကြေး ရပြီ!</b>\n\n💰 +${cfg.bonus.toLocaleString()} ကျပ်\n🏦 လက်ကျန်: ${updated.balance.toLocaleString()} ကျပ်`,
+        { parse_mode: 'HTML' }
+      ).catch(() => {});
+    }
+
+    res.json({ success: true, bonus: cfg.bonus, newBalance: updated.balance });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ===== Agent Deposit Control =====
 
 // Get pending deposits for agent's referral users
 app.get('/api/agent/deposits', isAgent, async (req, res) => {
   try {
     const agentId = req.agentUser.telegramId;
+    // Find all users referred by this agent
+    const referredUsers = await User.find({ referredBy: agentId }).select('telegramId firstName username').lean();
+    if (!referredUsers.length) return res.json([]);
 
-    // Collect referred users via both referredBy AND downlineLevels.level1
-    const agentUser = await User.findOne({ telegramId: agentId }).lean();
-    const level1Ids = (agentUser?.downlineLevels?.level1 || []).map(Number);
-
-    // referredBy query
-    const refByUsers = await User.find({ referredBy: agentId })
-      .select('telegramId firstName username').lean();
-    const refByIds = refByUsers.map(u => u.telegramId);
-
-    // Merge both lists (deduplicate)
-    const allIdsSet = new Set([...refByIds, ...level1Ids]);
-    if (!allIdsSet.size) return res.json([]);
-
-    const allIds = Array.from(allIdsSet);
-
-    // Build userMap
-    const allUsers = await User.find({ telegramId: { $in: allIds } })
-      .select('telegramId firstName username').lean();
+    const referredIds = referredUsers.map(u => u.telegramId);
     const userMap = {};
-    allUsers.forEach(u => {
-      userMap[u.telegramId] = u.firstName || u.username || `User${u.telegramId}`;
-    });
+    referredUsers.forEach(u => { userMap[u.telegramId] = u.firstName || u.username || `User${u.telegramId}`; });
 
     const status = req.query.status || 'pending';
-    const deps = await Deposit.find({ userId: { $in: allIds }, status })
-      .sort({ createdAt: -1 }).limit(100).lean();
-    res.json(deps.map(d => ({ ...d, userName: userMap[d.userId] || `User${d.userId}` })));
-  } catch(e) { console.error('agent/deposits err:', e); res.status(500).json({ error: e.message }); }
+    const deps = await Deposit.find({ userId: { $in: referredIds }, status })
+      .sort({ createdAt: -1 }).limit(50).lean();
+
+    const out = deps.map(d => ({
+      ...d,
+      userName: userMap[d.userId] || String(d.userId)
+    }));
+    res.json(out);
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Agent confirms deposit (deducts from agent balance, credits user)
+// Agent confirms a deposit for their referral user
 app.post('/api/agent/deposits/:id/confirm', isAgent, async (req, res) => {
   try {
     const agentId = req.agentUser.telegramId;
-    // Atomic lock
+
+    // ── Atomic status flip: only proceed if status was 'pending' ──
+    // This prevents double-confirm race condition even with simultaneous requests
     const dep = await Deposit.findOneAndUpdate(
       { _id: req.params.id, status: 'pending' },
-      { $set: { status: 'confirming' } },
+      { $set: { status: 'confirming' } }, // temp lock state
       { new: false }
+    );
+    if (!dep) {
+      // Either not found or already processed
+      const existing = await Deposit.findById(req.params.id).lean();
+      if (!existing) return res.status(404).json({ error: 'မတွေ့ပါ' });
+      return res.status(400).json({ error: 'ပြင်ဆင်ပြီးသားဖြစ်သည် (Double confirm ကာကွယ်ထားသည်)' });
+    }
+
+    // Verify this deposit belongs to one of the agent's referrals
+    const user = await User.findOne({ telegramId: dep.userId }).lean();
+    if (!user || user.referredBy !== agentId) {
+      // Revert lock
+      await Deposit.findByIdAndUpdate(dep._id, { $set: { status: 'pending' } });
+      return res.status(403).json({ error: 'ဤ User သည် သင့် Referral မဟုတ်ပါ' });
+    }
+
+    // ── Agent Wallet Check ──
+    const agentFresh = await User.findOne({ telegramId: agentId }).lean();
+    if (!agentFresh || agentFresh.balance < dep.amount) {
+      // Revert lock
+      await Deposit.findByIdAndUpdate(dep._id, { $set: { status: 'pending' } });
+      return res.status(402).json({
+        error: `လက်ကျန်ငွေ မလောက်ပါ (ကျန်: ${(agentFresh?.balance||0).toLocaleString()} ကျပ် / လိုသည်: ${dep.amount.toLocaleString()} ကျပ်)\nGame Developer ကို ဆက်သွယ်ပြီး ယူနစ်ဖြည့်ပါ`,
+        insufficientBalance: true,
+        agentBalance: agentFresh?.balance || 0,
+        required: dep.amount
+      });
+    }
+
+    // ── Finalize confirm ──
+    const TTL_72H = new Date(Date.now() + 72 * 60 * 60 * 1000);
+    await Deposit.findByIdAndUpdate(dep._id, {
+      $set: { status: 'confirmed', processedAt: new Date(), processedBy: 'agent', expireAt: TTL_72H }
+    });
+
+    // Deduct from agent balance, credit to user balance — atomic via separate updates
+    await User.findOneAndUpdate({ telegramId: agentId }, { $inc: { balance: -dep.amount } });
+    await User.findOneAndUpdate({ telegramId: dep.userId }, { $inc: { balance: dep.amount } });
+
+    // First deposit referral bonus (100 ကျပ် to agent)
+    const prevDeps = await Deposit.countDocuments({ userId: dep.userId, status: 'confirmed', _id: { $ne: dep._id } });
+    if (prevDeps === 0) {
+      await User.findOneAndUpdate({ telegramId: agentId }, { $inc: { balance: 100 } });
+      if (bot) bot.telegram.sendMessage(agentId,
+        `🎉 Referral မှ ပထမဆုံး ငွေဖြည့်သောကြောင့် <b>၁၀၀ ကျပ်</b> ရရှိပါပြီ!`,
+        { parse_mode: 'HTML' }).catch(() => {});
+    }
+
+    // Agent milestone update
+    await updateAgentMilestone(agentId, dep.amount);
+
+    // Notify user via bot
+    const methodLabel = dep.paymentMethod === 'wave' ? '🌊 Wave Pay' : '📱 KPay';
+    if (bot) bot.telegram.sendMessage(dep.userId,
+      `✅ ငွေ ${dep.amount.toLocaleString()} ကျပ် သွင်းမှု အတည်ပြုပြီး!\n${methodLabel}\n\nသင့်လက်ကျန်ငွေ ပေါင်းထည့်ပြီး 🎉`,
+      Markup.inlineKeyboard([[Markup.button.webApp('🎮 ကစားမည်', FRONTEND_URL)]]) ).catch(() => {});
+
+    // Notify Admin about agent-confirmed deposit (record keeping)
+    const agentName = agentFresh.firstName || agentFresh.username || `Agent${agentId}`;
+    const userName = user.firstName || user.username || `User${dep.userId}`;
+    if (bot) bot.telegram.sendMessage(ADMIN_ID,
+      `🎯 <b>Agent မှ Deposit Confirm</b>\n👤 User: ${userName} (${dep.userId})\n💰 ${dep.amount.toLocaleString()} ကျပ် (${methodLabel})\n🎯 Agent: ${agentName} (${agentId})\n🔢 Txn: <code>${dep.transactionId}</code>`,
+      { parse_mode: 'HTML' }).catch(() => {});
+
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Agent rejects a deposit for their referral user
+app.post('/api/agent/deposits/:id/reject', isAgent, async (req, res) => {
+  try {
+    const agentId = req.agentUser.telegramId;
+    const { reason } = req.body;
+
+    // Atomic reject — prevent double-click issues
+    const dep = await Deposit.findOneAndUpdate(
+      { _id: req.params.id, status: 'pending' },
+      { $set: { status: 'rejected', processedAt: new Date(), processedBy: 'agent',
+                expireAt: new Date(Date.now() + 72 * 60 * 60 * 1000) } },
+      { new: true }
     );
     if (!dep) {
       const existing = await Deposit.findById(req.params.id).lean();
       if (!existing) return res.status(404).json({ error: 'မတွေ့ပါ' });
       return res.status(400).json({ error: 'ပြင်ဆင်ပြီးသားဖြစ်သည်' });
     }
-    // Verify belongs to agent's referral (via referredBy OR level1)
+
+    // Verify this deposit belongs to one of the agent's referrals
     const user = await User.findOne({ telegramId: dep.userId }).lean();
-    const agentUser2 = await User.findOne({ telegramId: agentId }).lean();
-    const level1Ids2 = (agentUser2?.downlineLevels?.level1 || []).map(Number);
-    const isMyUser = user && (user.referredBy === agentId || level1Ids2.includes(Number(dep.userId)));
-    if (!isMyUser) {
-      await Deposit.findByIdAndUpdate(dep._id, { $set: { status: 'pending' } });
+    if (!user || user.referredBy !== agentId) {
       return res.status(403).json({ error: 'ဤ User သည် သင့် Referral မဟုတ်ပါ' });
     }
-    // Check agent balance
-    const agentFresh = await User.findOne({ telegramId: agentId }).lean();
-    if (!agentFresh || agentFresh.balance < dep.amount) {
-      await Deposit.findByIdAndUpdate(dep._id, { $set: { status: 'pending' } });
-      return res.status(402).json({
-        error: `လက်ကျန်ငွေ မလောက်ပါ (ကျန်: ${(agentFresh?.balance||0).toLocaleString()} / လို: ${dep.amount.toLocaleString()} ကျပ်)\nAdmin ထံ ဆက်သွယ်ပြီး ယူနစ်ဖြည့်ပါ`,
-        insufficientBalance: true, agentBalance: agentFresh?.balance||0, required: dep.amount
-      });
-    }
-    // Finalize
-    const TTL = new Date(Date.now() + 72*60*60*1000);
-    await Deposit.findByIdAndUpdate(dep._id, { $set: { status:'confirmed', processedAt:new Date(), processedBy:'agent', expireAt:TTL } });
-    await User.findOneAndUpdate({ telegramId: agentId }, { $inc: { balance: -dep.amount } });
-    await User.findOneAndUpdate({ telegramId: dep.userId }, { $inc: { balance: dep.amount } });
-    // First deposit bonus 100 ကျပ်
-    const prevDeps = await Deposit.countDocuments({ userId: dep.userId, status:'confirmed', _id:{$ne:dep._id} });
-    if (prevDeps === 0) {
-      await User.findOneAndUpdate({ telegramId: agentId }, { $inc: { balance: 100 } });
-      if (bot) bot.telegram.sendMessage(agentId, `🎉 Referral ပထမဆုံး ငွေဖြည့် — <b>100 ကျပ်</b> ရရှိပြီ!`, { parse_mode:'HTML' }).catch(()=>{});
-    }
-    // Distribute unilevel commission
-    await distributeCommission(dep.userId, dep.amount, dep._id);
-    // Update agent loop bonus
-    await updateAgentLoopBonus(agentId, dep.amount);
-    const methodLabel = dep.paymentMethod === 'wave' ? '🌊 Wave Pay' : '📱 KPay';
-    if (bot) bot.telegram.sendMessage(dep.userId,
-      `✅ ငွေ ${dep.amount.toLocaleString()} ကျပ် သွင်းမှု အတည်ပြုပြီး!\n${methodLabel}\n\nသင့်လက်ကျန်ငွေ ပေါင်းထည့်ပြီး 🎉`,
-      Markup.inlineKeyboard([[Markup.button.webApp('🎮 ကစားမည်', FRONTEND_URL)]])).catch(()=>{});
-    const agentName = agentFresh.firstName || agentFresh.username || `Agent${agentId}`;
-    const userName = user.firstName || user.username || `User${dep.userId}`;
-    if (bot) bot.telegram.sendMessage(ADMIN_ID,
-      `🎯 <b>Agent မှ Deposit Confirm</b>\n👤 User: ${userName} (${dep.userId})\n💰 ${dep.amount.toLocaleString()} ကျပ် (${methodLabel})\n🎯 Agent: ${agentName} (${agentId})`,
-      { parse_mode:'HTML' }).catch(()=>{});
-    res.json({ success: true });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
 
-// Agent rejects deposit
-app.post('/api/agent/deposits/:id/reject', isAgent, async (req, res) => {
-  try {
-    const agentId = req.agentUser.telegramId;
-    const { reason } = req.body;
-    const dep = await Deposit.findOneAndUpdate(
-      { _id: req.params.id, status: 'pending' },
-      { $set: { status:'rejected', processedAt:new Date(), processedBy:'agent', expireAt:new Date(Date.now()+72*60*60*1000) } },
-      { new: true }
-    );
-    if (!dep) return res.status(400).json({ error: 'မတွေ့ပါ သို့မဟုတ် ပြင်ဆင်ပြီးသားဖြစ်သည်' });
-    const user = await User.findOne({ telegramId: dep.userId }).lean();
-    const agentUser3 = await User.findOne({ telegramId: agentId }).lean();
-    const level1Ids3 = (agentUser3?.downlineLevels?.level1 || []).map(Number);
-    const isMyUser2 = user && (user.referredBy === agentId || level1Ids3.includes(Number(dep.userId)));
-    if (!isMyUser2) return res.status(403).json({ error: 'သင့် Referral မဟုတ်ပါ' });
+    const reasonText = reason ? `\nအကြောင်းပြချက်: ${reason}` : '';
     if (bot) bot.telegram.sendMessage(dep.userId,
-      `❌ ငွေ ${dep.amount.toLocaleString()} ကျပ် သွင်းမှု ပယ်ချပြီ\nTxn: ${dep.transactionId}${reason ? '\nအကြောင်း: '+reason : ''}`).catch(()=>{});
+      `❌ ငွေ ${dep.amount.toLocaleString()} ကျပ် သွင်းမှု ပယ်ချပြီ\nTxn: ${dep.transactionId}${reasonText}`).catch(() => {});
+
     res.json({ success: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -2337,8 +2223,8 @@ app.get('/api/payment-info/:telegramId', async (req, res) => {
       kpayNumber: agentDoc.agentKpayNumber,
       kpayName: agentDoc.agentKpayName || '',
       hasWave: agentDoc.hasWave || false,
-      waveNumber: agentDoc.agentWaveNumber || '',
-      waveName: agentDoc.agentWaveName || '',
+      waveNumber: '',
+      waveName: '',
       isAgentPayment: true
     });
   } catch(e) { res.status(500).json({ error: e.message }); }
@@ -2348,14 +2234,16 @@ app.get('/api/payment-info/:telegramId', async (req, res) => {
 app.post('/api/admin/agents/:tid/payment-info', isAdmin, async (req, res) => {
   try {
     const tid = parseInt(req.params.tid);
-    const { kpayNumber, kpayName, hasWave, waveNumber, waveName } = req.body;
+    const { kpayNumber, kpayName, hasWave } = req.body;
     if (!kpayNumber) return res.status(400).json({ error: 'KPay နံပါတ် လိုသည်' });
+
     const agent = await Agent.findOneAndUpdate(
       { telegramId: tid },
-      { $set: { agentKpayNumber: kpayNumber, agentKpayName: kpayName||'', hasWave:!!hasWave, agentWaveNumber:waveNumber||'', agentWaveName:waveName||'' } },
-      { new: true, upsert: true }
+      { $set: { agentKpayNumber: kpayNumber, agentKpayName: kpayName || '', hasWave: !!hasWave } },
+      { new: true, upsert: false }
     );
-    res.json({ success: true });
+    if (!agent) return res.status(404).json({ error: 'Agent Data မတွေ့ပါ' });
+    res.json({ success: true, agentKpayNumber: agent.agentKpayNumber, agentKpayName: agent.agentKpayName });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -2428,33 +2316,41 @@ app.get('/api/admin/agent-referrals', isAdmin, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Admin: Make user an Agent (with KPay/Wave info required)
+// Admin: Make user an Agent
 app.post('/api/admin/users/:tid/make-agent', isAdmin, async (req, res) => {
   try {
     const tid = parseInt(req.params.tid);
-    const { isAgent: makeAgent, kpayNumber, kpayName, hasWave, waveNumber, waveName } = req.body;
+    const { isAgent: makeAgent } = req.body;
     const newRole = makeAgent ? 'agent' : 'user';
-    const u = await User.findOneAndUpdate({ telegramId: tid }, { role: newRole }, { new: true });
+    const u = await User.findOneAndUpdate(
+      { telegramId: tid },
+      { role: newRole },
+      { new: true }
+    );
     if (!u) return res.status(404).json({ error: 'User မတွေ့ပါ' });
 
     if (makeAgent) {
-      if (!kpayNumber) return res.status(400).json({ error: 'KPay နံပါတ် လိုသည်' });
+      // Create agent record if not exists
       await Agent.findOneAndUpdate(
         { telegramId: tid },
-        { $set: {
-            telegramId: tid, referralCode: u.referralCode,
-            agentKpayNumber: kpayNumber, agentKpayName: kpayName || '',
-            hasWave: !!hasWave, agentWaveNumber: waveNumber || '', agentWaveName: waveName || ''
-          }
-        },
+        { $setOnInsert: { telegramId: tid, referralCode: u.referralCode } },
         { upsert: true }
       );
-      if (bot) bot.telegram.sendMessage(tid,
-        `🎯 <b>Agent အဖြစ် ခွင့်ပြုပြီ!</b>\n\n🎉 မင်္ဂလာပါ Agent!\n\nBot တွင် <code>/agent</code> ရိုက်ပြီး Agent Panel ဝင်ရောက်ပါ`,
-        { parse_mode: 'HTML' }).catch(()=>{});
+      if (bot) {
+        bot.telegram.sendMessage(tid,
+          `🎯 <b>Agent အဖြစ် ခွင့်ပြုပြီ!</b>\n\n🎉 မင်္ဂလာပါ Agent!\n\nBot တွင် <code>/agent</code> ရိုက်ပြီး Agent Panel ကို ဝင်ရောက်ပါ`,
+          { parse_mode: 'HTML' }
+        ).catch(() => {});
+      }
     } else {
-      if (bot) bot.telegram.sendMessage(tid, `ℹ️ သင်၏ Agent အဆင့်ကို ဖယ်ရှားပြီးပါပြီ`).catch(()=>{});
+      if (bot) {
+        bot.telegram.sendMessage(tid,
+          `ℹ️ သင်၏ Agent အဆင့်ကို ဖယ်ရှားပြီးပါပြီ`,
+          { parse_mode: 'HTML' }
+        ).catch(() => {});
+      }
     }
+
     res.json({ success: true, role: newRole });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -2479,12 +2375,10 @@ app.get('/api/admin/agents', isAdmin, async (req, res) => {
     const enriched = await Promise.all(agents.map(async u => {
       const agentDoc = await Agent.findOne({ telegramId: u.telegramId }).lean();
       const totalReferrals = await User.countDocuments({ referredBy: u.telegramId });
-      const freshUser = await User.findOne({ telegramId: u.telegramId }).select('totalCommission todayCommission').lean();
       return {
         ...u,
         agentData: agentDoc,
-        totalReferrals,
-        totalCommission: freshUser?.totalCommission||0
+        totalReferrals
       };
     }));
 
@@ -2506,6 +2400,49 @@ app.get('/api/admin/agents/:tid', isAdmin, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// Admin: Reset agent milestone
+app.post('/api/admin/agents/:tid/reset-box', isAdmin, async (req, res) => {
+  try {
+    const tid = parseInt(req.params.tid);
+    const { box } = req.body;
+    const boxNum = parseInt(box);
+    const agent = await Agent.findOne({ telegramId: tid });
+    if (!agent) return res.status(404).json({ error: 'Agent Data မတွေ့ပါ' });
+    agent.milestones[boxNum].current = 0;
+    agent.milestones[boxNum].claimed = false;
+    await agent.save();
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Admin: Manually award agent box bonus
+app.post('/api/admin/agents/:tid/award-box', isAdmin, async (req, res) => {
+  try {
+    const tid = parseInt(req.params.tid);
+    const { box } = req.body;
+    const boxNum = parseInt(box);
+    const cfg = BOX_CONFIG.find(b => b.box === boxNum);
+    if (!cfg) return res.status(400).json({ error: 'Box မတွေ့ပါ' });
+
+    const u = await User.findOneAndUpdate({ telegramId: tid }, { $inc: { balance: cfg.bonus } }, { new: true });
+    if (!u) return res.status(404).json({ error: 'User မတွေ့ပါ' });
+
+    const agent = await Agent.findOne({ telegramId: tid });
+    if (agent) {
+      if (!cfg.loop) agent.milestones[boxNum].claimed = true;
+      agent.totalEarned = (agent.totalEarned || 0) + cfg.bonus;
+      await agent.save();
+    }
+
+    if (bot) {
+      bot.telegram.sendMessage(tid,
+        `🎁 <b>Admin မှ Box ${boxNum} ဆုကြေး ပေးအပ်</b>\n💰 +${cfg.bonus.toLocaleString()} MMK`,
+        { parse_mode: 'HTML' }
+      ).catch(() => {});
+    }
+    res.json({ success: true, bonus: cfg.bonus, newBalance: u.balance });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
 
 // ===== Redeem Code API =====
 
@@ -2593,119 +2530,6 @@ app.delete('/api/admin/redeem/:id', isAdmin, async(req, res) => {
   try {
     await RedeemCode.findByIdAndDelete(req.params.id);
     res.json({ success: true });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// ===== Commission & Downline API Routes =====
-
-// POST /api/register — new user with referral
-app.post('/api/register', async (req, res) => {
-  try {
-    const { telegramId, username, firstName, referralCode } = req.body;
-    if (!telegramId) return res.status(400).json({ error: 'telegramId လိုသည်' });
-    const tid = parseInt(telegramId);
-    let user = await User.findOne({ telegramId: tid }).lean();
-    if (user) return res.json({ telegramId: user.telegramId, referralCode: user.referralCode, exists: true });
-    const newUser = new User({ telegramId: tid, username: username || '', firstName: firstName || '', referralCode: genRefCode(tid) });
-    if (referralCode) {
-      const ref = await User.findOne({ referralCode }).lean();
-      if (ref && ref.telegramId !== tid) {
-        newUser.referredBy = ref.telegramId;
-        await newUser.save();
-        await updateReferralChain(tid, ref.telegramId);
-      } else await newUser.save();
-    } else await newUser.save();
-    res.json({ telegramId: newUser.telegramId, referralCode: newUser.referralCode, exists: false });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// GET /api/commission/history/:userId
-app.get('/api/commission/history/:userId', async (req, res) => {
-  try {
-    const uid = parseInt(req.params.userId);
-    const page = Math.max(1, parseInt(req.query.page) || 1);
-    const limit = 20;
-    const skip = (page - 1) * limit;
-    const logs = await CommissionLog.find({ userId: uid }).sort({ createdAt: -1 }).skip(skip).limit(limit).lean();
-    const total = await CommissionLog.countDocuments({ userId: uid });
-    res.json({ logs, total, pages: Math.ceil(total / limit), page });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// GET /api/commission/summary/:userId
-app.get('/api/commission/summary/:userId', async (req, res) => {
-  try {
-    const uid = parseInt(req.params.userId);
-    const user = await User.findOne({ telegramId: uid }).lean();
-    if (!user) return res.status(404).json({ error: 'User မတွေ့ပါ' });
-    const now = new Date();
-    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-    const lastReset = user.lastCommissionReset ? new Date(user.lastCommissionReset) : new Date(0);
-    res.json({
-      totalCommission: user.totalCommission || 0,
-      todayCommission: lastReset >= todayStart ? (user.todayCommission || 0) : 0,
-      monthCommission: lastReset >= monthStart ? (user.monthCommission || 0) : 0
-    });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// GET /api/downline/tree/:userId
-app.get('/api/downline/tree/:userId', async (req, res) => {
-  try {
-    const uid = parseInt(req.params.userId);
-    const user = await User.findOne({ telegramId: uid }).select('downlineLevels').lean();
-    if (!user) return res.status(404).json({ error: 'User မတွေ့ပါ' });
-    const tree = {};
-    for (let i = 1; i <= 10; i++) {
-      const key = `level${i}`;
-      const ids = user.downlineLevels?.[key] || [];
-      const commAgg = ids.length ? await CommissionLog.aggregate([
-        { $match: { userId: uid, level: i } },
-        { $group: { _id: null, total: { $sum: '$amount' } } }
-      ]) : [];
-      tree[key] = { count: ids.length, commission: commAgg[0]?.total || 0 };
-    }
-    res.json(tree);
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// GET /api/agent/commission-logs (paginated, for agent panel)
-app.get('/api/agent/commission-logs', isAgent, async (req, res) => {
-  try {
-    const uid = req.agentUser.telegramId;
-    const page = Math.max(1, parseInt(req.query.page) || 1);
-    const limit = 20;
-    const logs = await CommissionLog.find({ userId: uid }).sort({ createdAt: -1 }).skip((page-1)*limit).limit(limit).lean();
-    const total = await CommissionLog.countDocuments({ userId: uid });
-    res.json({ logs, total, pages: Math.ceil(total / limit) });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// POST /api/agent/claim-bonus
-app.post('/api/agent/claim-bonus', isAgent, async (req, res) => {
-  try {
-    const tid = req.agentUser.telegramId;
-    const agent = await Agent.findOne({ telegramId: tid });
-    if (!agent) return res.status(404).json({ error: 'Agent data မတွေ့ပါ' });
-    if (!agent.bonusClaimable) return res.status(400).json({ error: 'ဆုကြေး မပြည့်သေးပါ' });
-
-    // Give bonus, reset progress
-    const updated = await User.findOneAndUpdate(
-      { telegramId: tid },
-      { $inc: { balance: LOOP_BONUS_AMOUNT } },
-      { new: true }
-    );
-    agent.bonusProgress = 0;
-    agent.bonusClaimable = false;
-    agent.bonusCycleCount = (agent.bonusCycleCount || 0) + 1;
-    await agent.save();
-
-    if (bot) bot.telegram.sendMessage(tid,
-      `🎉 <b>Loop Bonus ရပြီ!</b>\n💰 +${LOOP_BONUS_AMOUNT.toLocaleString()} ကျပ်\n🔄 Cycle ${agent.bonusCycleCount} ပြီးပါပြီ — နောက်တစ်ကြိမ် ပြန်စနေပါပြီ`,
-      { parse_mode: 'HTML' }).catch(() => {});
-
-    res.json({ success: true, bonus: LOOP_BONUS_AMOUNT, newBalance: updated.balance, cycleCount: agent.bonusCycleCount });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
