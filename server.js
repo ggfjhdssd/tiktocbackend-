@@ -2193,16 +2193,35 @@ app.get('/api/agent/referrals', isAgent, async (req, res) => {
 app.get('/api/agent/deposits', isAgent, async (req, res) => {
   try {
     const agentId = req.agentUser.telegramId;
-    const referredUsers = await User.find({ referredBy: agentId }).select('telegramId firstName username').lean();
-    if (!referredUsers.length) return res.json([]);
-    const referredIds = referredUsers.map(u => u.telegramId);
+
+    // Collect referred users via both referredBy AND downlineLevels.level1
+    const agentUser = await User.findOne({ telegramId: agentId }).lean();
+    const level1Ids = (agentUser?.downlineLevels?.level1 || []).map(Number);
+
+    // referredBy query
+    const refByUsers = await User.find({ referredBy: agentId })
+      .select('telegramId firstName username').lean();
+    const refByIds = refByUsers.map(u => u.telegramId);
+
+    // Merge both lists (deduplicate)
+    const allIdsSet = new Set([...refByIds, ...level1Ids]);
+    if (!allIdsSet.size) return res.json([]);
+
+    const allIds = Array.from(allIdsSet);
+
+    // Build userMap
+    const allUsers = await User.find({ telegramId: { $in: allIds } })
+      .select('telegramId firstName username').lean();
     const userMap = {};
-    referredUsers.forEach(u => { userMap[u.telegramId] = u.firstName || u.username || `User${u.telegramId}`; });
+    allUsers.forEach(u => {
+      userMap[u.telegramId] = u.firstName || u.username || `User${u.telegramId}`;
+    });
+
     const status = req.query.status || 'pending';
-    const deps = await Deposit.find({ userId: { $in: referredIds }, status })
-      .sort({ createdAt: -1 }).limit(50).lean();
-    res.json(deps.map(d => ({ ...d, userName: userMap[d.userId] || String(d.userId) })));
-  } catch(e) { res.status(500).json({ error: e.message }); }
+    const deps = await Deposit.find({ userId: { $in: allIds }, status })
+      .sort({ createdAt: -1 }).limit(100).lean();
+    res.json(deps.map(d => ({ ...d, userName: userMap[d.userId] || `User${d.userId}` })));
+  } catch(e) { console.error('agent/deposits err:', e); res.status(500).json({ error: e.message }); }
 });
 
 // Agent confirms deposit (deducts from agent balance, credits user)
@@ -2220,9 +2239,12 @@ app.post('/api/agent/deposits/:id/confirm', isAgent, async (req, res) => {
       if (!existing) return res.status(404).json({ error: 'မတွေ့ပါ' });
       return res.status(400).json({ error: 'ပြင်ဆင်ပြီးသားဖြစ်သည်' });
     }
-    // Verify belongs to agent's referral
+    // Verify belongs to agent's referral (via referredBy OR level1)
     const user = await User.findOne({ telegramId: dep.userId }).lean();
-    if (!user || user.referredBy !== agentId) {
+    const agentUser2 = await User.findOne({ telegramId: agentId }).lean();
+    const level1Ids2 = (agentUser2?.downlineLevels?.level1 || []).map(Number);
+    const isMyUser = user && (user.referredBy === agentId || level1Ids2.includes(Number(dep.userId)));
+    if (!isMyUser) {
       await Deposit.findByIdAndUpdate(dep._id, { $set: { status: 'pending' } });
       return res.status(403).json({ error: 'ဤ User သည် သင့် Referral မဟုတ်ပါ' });
     }
@@ -2275,7 +2297,10 @@ app.post('/api/agent/deposits/:id/reject', isAgent, async (req, res) => {
     );
     if (!dep) return res.status(400).json({ error: 'မတွေ့ပါ သို့မဟုတ် ပြင်ဆင်ပြီးသားဖြစ်သည်' });
     const user = await User.findOne({ telegramId: dep.userId }).lean();
-    if (!user || user.referredBy !== agentId) return res.status(403).json({ error: 'သင့် Referral မဟုတ်ပါ' });
+    const agentUser3 = await User.findOne({ telegramId: agentId }).lean();
+    const level1Ids3 = (agentUser3?.downlineLevels?.level1 || []).map(Number);
+    const isMyUser2 = user && (user.referredBy === agentId || level1Ids3.includes(Number(dep.userId)));
+    if (!isMyUser2) return res.status(403).json({ error: 'သင့် Referral မဟုတ်ပါ' });
     if (bot) bot.telegram.sendMessage(dep.userId,
       `❌ ငွေ ${dep.amount.toLocaleString()} ကျပ် သွင်းမှု ပယ်ချပြီ\nTxn: ${dep.transactionId}${reason ? '\nအကြောင်း: '+reason : ''}`).catch(()=>{});
     res.json({ success: true });
