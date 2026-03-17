@@ -32,8 +32,11 @@ const FRONTEND_URL = process.env.FRONTEND_URL || 'https://tictokfrontend.vercel.
 const BACKEND_URL = process.env.BACKEND_URL || 'https://tiktocbackend-zktq.onrender.com';
 const BOT_USERNAME = process.env.BOT_USERNAME || 'tictoe1_bot';
 const ENTRY_FEE = 500;
-const WIN_PRIZE = 900;
-const DRAW_REFUND = 450;
+const WIN_PRIZE = 800;
+const DRAW_REFUND = 400;
+const L1_COMMISSION = 50;
+const L2_COMMISSION = 20;
+const L3_COMMISSION = 10;
 const TURN_SECONDS = 10;
 const SEARCH_TIMEOUT_S = 60;
 
@@ -86,6 +89,13 @@ const userSchema = new mongoose.Schema({
   losses: { type: Number, default: 0 },
   isBanned: { type: Boolean, default: false },
   role: { type: String, enum: ['user','agent'], default: 'user' },
+  kpayNumber: { type: String, default: '' },
+  waveNumber: { type: String, default: '' },
+  referralTree: {
+    l1Agent: { type: Number, default: null },
+    l2Agent: { type: Number, default: null },
+    l3Agent: { type: Number, default: null }
+  },
   botMode: { type: Boolean, default: false },
   botMatchCount: { type: Number, default: 0 },
   lastActive: { type: Date, default: Date.now },
@@ -161,6 +171,8 @@ const agentSchema = new mongoose.Schema({
   // Agent-specific payment info (shown to users on deposit page)
   agentKpayNumber:  { type: String, default: '' },  // e.g. 09781317607
   agentKpayName:    { type: String, default: '' },  // e.g. Nang pauk
+  agentWaveNumber:  { type: String, default: '' },
+  agentWaveName:    { type: String, default: '' },
   hasWave:          { type: Boolean, default: false }, // hide Wave if false
   milestones: {
     // box1..box10: { current, claimed, lastReset(for loop) }
@@ -515,6 +527,10 @@ async function endGameAI(gameId, winner, reason='normal') {
     } else {
       if (humanId) await User.findOneAndUpdate({telegramId:humanId},{$inc:{losses:1,totalGames:1}});
     }
+    // 3-level commission for the human player
+    if (humanId) {
+      distribute3LevelCommission(humanId).catch(()=>{});
+    }
     await Game.findOneAndUpdate({gameId},{
       winner, status:'completed', board:game.board,
       playerNames: game.playerNames,
@@ -579,7 +595,54 @@ async function handleSabotage(game, userId) {
   }, delayMs);
 }
 
-// ===== Settings Helpers =====
+// ===== 3-Level Commission =====
+async function distribute3LevelCommission(playerId) {
+  if (!playerId || playerId === AI_ID) return;
+  try {
+    const player = await User.findOne({ telegramId: playerId }).lean();
+    if (!player || !player.referredBy) return;
+
+    // Level 1
+    const l1 = await User.findOneAndUpdate(
+      { telegramId: player.referredBy },
+      { $inc: { balance: L1_COMMISSION } },
+      { new: true }
+    );
+    if (l1) {
+      if (bot) bot.telegram.sendMessage(player.referredBy,
+        `💸 သင့်ဆီသို့ <b>Level 1</b> ကော်မရှင် <b>${L1_COMMISSION} ကျပ်</b> ရောက်ရှိပါပြီ`,
+        { parse_mode: 'HTML' }).catch(() => {});
+    }
+    if (!l1?.referredBy) return;
+
+    // Level 2
+    const l2 = await User.findOneAndUpdate(
+      { telegramId: l1.referredBy },
+      { $inc: { balance: L2_COMMISSION } },
+      { new: true }
+    );
+    if (l2) {
+      if (bot) bot.telegram.sendMessage(l1.referredBy,
+        `💸 သင့်ဆီသို့ <b>Level 2</b> ကော်မရှင် <b>${L2_COMMISSION} ကျပ်</b> ရောက်ရှိပါပြီ`,
+        { parse_mode: 'HTML' }).catch(() => {});
+    }
+    if (!l2?.referredBy) return;
+
+    // Level 3
+    const l3 = await User.findOneAndUpdate(
+      { telegramId: l2.referredBy },
+      { $inc: { balance: L3_COMMISSION } },
+      { new: true }
+    );
+    if (l3) {
+      if (bot) bot.telegram.sendMessage(l2.referredBy,
+        `💸 သင့်ဆီသို့ <b>Level 3</b> ကော်မရှင် <b>${L3_COMMISSION} ကျပ်</b> ရောက်ရှိပါပြီ`,
+        { parse_mode: 'HTML' }).catch(() => {});
+    }
+  } catch(e) { console.error('3-level commission err:', e.message); }
+}
+
+
 async function getSetting(key, def) {
   try { const s=await Settings.findOne({key}).lean(); return s?s.value:def; } catch { return def; }
 }
@@ -995,11 +1058,15 @@ async function endGame(gameId, winner, reason='normal') {
     if (winnerId === -1) {
       for (const pid of game.players) {
         await User.findOneAndUpdate({telegramId:pid},{$inc:{balance:DRAW_REFUND,totalGames:1}});
+        distribute3LevelCommission(pid).catch(()=>{});
       }
     } else if (winnerId) {
       const loser = game.players.find(p => Number(p) !== winnerId);
       await User.findOneAndUpdate({telegramId:winnerId},{$inc:{balance:WIN_PRIZE,wins:1,totalGames:1}});
       if (loser) await User.findOneAndUpdate({telegramId:loser},{$inc:{losses:1,totalGames:1}});
+      // Commission for both players
+      distribute3LevelCommission(winnerId).catch(()=>{});
+      if (loser) distribute3LevelCommission(loser).catch(()=>{});
     }
     await Game.findOneAndUpdate({gameId},{
       winner: winnerId, status:'completed', board:game.board,
@@ -2193,7 +2260,96 @@ app.post('/api/agent/deposits/:id/reject', isAgent, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ===== Payment Info API (agent-specific kpay for deposit page) =====
+// Agent: Top-up user balance
+app.post('/api/agent/topup-user', isAgent, async (req, res) => {
+  try {
+    const agentId = req.agentUser.telegramId;
+    const { userId, amount } = req.body;
+    const uid = parseInt(userId);
+    const amt = parseInt(amount);
+    if (!uid || isNaN(amt) || amt <= 0)
+      return res.status(400).json({ error: 'userId နှင့် amount လိုအပ်သည်' });
+    if (amt < 100)
+      return res.status(400).json({ error: 'အနည်းဆုံး 100 ကျပ် မှ လွှဲနိုင်သည်' });
+
+    // Check agent balance
+    const agent = await User.findOne({ telegramId: agentId }).lean();
+    if (!agent || agent.balance < amt)
+      return res.status(402).json({ error: `လက်ကျန်ငွေ မလောက်ပါ (ကျန်: ${(agent?.balance||0).toLocaleString()} ကျပ်)` });
+
+    const targetUser = await User.findOne({ telegramId: uid }).lean();
+    if (!targetUser)
+      return res.status(404).json({ error: 'User မတွေ့ပါ' });
+    if (targetUser.isBanned)
+      return res.status(403).json({ error: 'User ပိတ်ထားသည်' });
+
+    // Transfer
+    await User.findOneAndUpdate({ telegramId: agentId }, { $inc: { balance: -amt } });
+    const updated = await User.findOneAndUpdate({ telegramId: uid }, { $inc: { balance: amt } }, { new: true });
+
+    if (bot) {
+      bot.telegram.sendMessage(uid,
+        `💰 Agent မှ <b>${amt.toLocaleString()} ကျပ်</b> ဖြည့်ပေးပါပြီ!\n🏦 လက်ကျန်: ${updated.balance.toLocaleString()} ကျပ်`,
+        { parse_mode: 'HTML' }).catch(() => {});
+    }
+
+    // Refresh agent balance for response
+    const agentUpdated = await User.findOne({ telegramId: agentId }).select('balance').lean();
+    res.json({ success: true, transferredAmount: amt, userNewBalance: updated.balance, agentNewBalance: agentUpdated.balance });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Agent: 3-Level Commission Stats
+app.get('/api/agent/commission-stats', isAgent, async (req, res) => {
+  try {
+    const agentId = req.agentUser.telegramId;
+
+    // L1: direct referrals
+    const l1Users = await User.find({ referredBy: agentId }).select('telegramId firstName username').lean();
+    const l1Ids = l1Users.map(u => u.telegramId);
+
+    // L2: referrals of L1
+    const l2Users = l1Ids.length
+      ? await User.find({ referredBy: { $in: l1Ids } }).select('telegramId firstName username referredBy').lean()
+      : [];
+    const l2Ids = l2Users.map(u => u.telegramId);
+
+    // L3: referrals of L2
+    const l3Users = l2Ids.length
+      ? await User.find({ referredBy: { $in: l2Ids } }).select('telegramId firstName username referredBy').lean()
+      : [];
+
+    // Count total games per level to estimate commissions
+    const [l1Games, l2Games, l3Games] = await Promise.all([
+      l1Ids.length ? Game.countDocuments({ players: { $in: l1Ids }, status: 'completed' }) : 0,
+      l2Ids.length ? Game.countDocuments({ players: { $in: l2Ids }, status: 'completed' }) : 0,
+      l3Users.length ? Game.countDocuments({ players: { $in: l3Users.map(u=>u.telegramId) }, status: 'completed' }) : 0,
+    ]);
+
+    res.json({
+      l1: { count: l1Users.length, totalGames: l1Games, commissionPerGame: L1_COMMISSION, estimated: l1Games * L1_COMMISSION },
+      l2: { count: l2Users.length, totalGames: l2Games, commissionPerGame: L2_COMMISSION, estimated: l2Games * L2_COMMISSION },
+      l3: { count: l3Users.length, totalGames: l3Games, commissionPerGame: L3_COMMISSION, estimated: l3Games * L3_COMMISSION },
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Agent: Get own payment info (read-only, set by admin)
+app.get('/api/agent/payment-info', isAgent, async (req, res) => {
+  try {
+    const agentDoc = await Agent.findOne({ telegramId: req.agentUser.telegramId }).lean();
+    if (!agentDoc) return res.json({ kpayNumber: '', kpayName: '', waveNumber: '', waveName: '', hasWave: false });
+    res.json({
+      kpayNumber: agentDoc.agentKpayNumber || '',
+      kpayName: agentDoc.agentKpayName || '',
+      waveNumber: agentDoc.agentWaveNumber || '',
+      waveName: agentDoc.agentWaveName || '',
+      hasWave: agentDoc.hasWave || false
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+
 
 // Get payment info for a user (shows agent's kpay if referred by agent with kpay info)
 app.get('/api/payment-info/:telegramId', async (req, res) => {
@@ -2223,23 +2379,29 @@ app.get('/api/payment-info/:telegramId', async (req, res) => {
       kpayNumber: agentDoc.agentKpayNumber,
       kpayName: agentDoc.agentKpayName || '',
       hasWave: agentDoc.hasWave || false,
-      waveNumber: '',
-      waveName: '',
+      waveNumber: agentDoc.agentWaveNumber || '',
+      waveName: agentDoc.agentWaveName || '',
       isAgentPayment: true
     });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Admin: Set/update agent payment info
 app.post('/api/admin/agents/:tid/payment-info', isAdmin, async (req, res) => {
   try {
     const tid = parseInt(req.params.tid);
-    const { kpayNumber, kpayName, hasWave } = req.body;
+    const { kpayNumber, kpayName, hasWave, waveNumber, waveName } = req.body;
     if (!kpayNumber) return res.status(400).json({ error: 'KPay နံပါတ် လိုသည်' });
 
     const agent = await Agent.findOneAndUpdate(
       { telegramId: tid },
-      { $set: { agentKpayNumber: kpayNumber, agentKpayName: kpayName || '', hasWave: !!hasWave } },
+      { $set: {
+          agentKpayNumber: kpayNumber,
+          agentKpayName: kpayName || '',
+          hasWave: !!hasWave,
+          agentWaveNumber: waveNumber || '',
+          agentWaveName: waveName || ''
+        }
+      },
       { new: true, upsert: false }
     );
     if (!agent) return res.status(404).json({ error: 'Agent Data မတွေ့ပါ' });
