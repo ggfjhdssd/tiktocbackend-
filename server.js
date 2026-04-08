@@ -38,7 +38,7 @@ const DRAW_REFUND = 400;
 // ── Feature 2: Multi-Tier Bet — exact reward table ──
 const VALID_BETS = [500, 1000, 3000];
 const BET_TABLE = {
-  500:  { entryFee: 500,  winPrize: 800,  drawRefund: 450  },
+  500:  { entryFee: 500,  winPrize: 800,  drawRefund: 400  },
   1000: { entryFee: 1000, winPrize: 1700, drawRefund: 900  },
   3000: { entryFee: 3000, winPrize: 5500, drawRefund: 2800 },
 };
@@ -543,25 +543,27 @@ async function endGameAI(gameId, winner, reason='normal') {
   const { winPrize, drawRefund } = getBetPrizes(betAmt);
   try {
     if (winner === -1) {
-      if (humanId) await User.findOneAndUpdate({telegramId:humanId},{$inc:{balance:drawRefund,totalGames:1}});
+      // Draw — refund + totalGames + turnoverProgress (always counts toward turnover)
+      if (humanId) await User.findOneAndUpdate(
+        { telegramId: humanId },
+        { $inc: { balance: drawRefund, totalGames: 1, turnoverProgress: betAmt } }
+      );
     } else if (winner === humanId) {
-      // ✅ FIX: combined $inc + $set in one atomic update
+      // Human wins — prize + stats reset consecutiveLosses + turnoverProgress
       await User.findOneAndUpdate(
         { telegramId: humanId },
-        { $inc: { balance: winPrize, wins: 1, totalGames: 1 }, $set: { consecutiveLosses: 0 } }
+        { $inc: { balance: winPrize, wins: 1, totalGames: 1, turnoverProgress: betAmt },
+          $set: { consecutiveLosses: 0 } }
       );
     } else {
+      // Human loses — stats + consecutiveLosses + turnoverProgress
       if (humanId) {
-        await User.findOneAndUpdate({telegramId:humanId},{$inc:{losses:1,totalGames:1,consecutiveLosses:1}});
+        await User.findOneAndUpdate(
+          { telegramId: humanId },
+          { $inc: { losses: 1, totalGames: 1, consecutiveLosses: 1, turnoverProgress: betAmt } }
+        );
         await checkRescueBonus(humanId);
       }
-    }
-    // ── Feature 1: Turnover progress ──
-    if (humanId) {
-      await User.findOneAndUpdate(
-        { telegramId: humanId, turnoverTarget: { $gt: 0 } },
-        { $inc: { turnoverProgress: betAmt } }
-      ).catch(() => {});
     }
     // 3-level commission for the human player
     if (humanId) {
@@ -1139,32 +1141,33 @@ async function endGame(gameId, winner, reason='normal') {
 
   try {
     if (winnerId === -1) {
+      // Draw — both players get refund + totalGames + turnoverProgress
       for (const pid of game.players) {
-        await User.findOneAndUpdate({telegramId:pid},{$inc:{balance:drawRefund,totalGames:1}});
+        await User.findOneAndUpdate(
+          { telegramId: pid },
+          { $inc: { balance: drawRefund, totalGames: 1, turnoverProgress: betAmt } }
+        );
         distribute3LevelCommission(pid).catch(()=>{});
       }
     } else if (winnerId) {
       const loser = game.players.find(p => Number(p) !== winnerId);
-      // ✅ FIX: $set must be at same level as $inc, never nested inside
+      // Winner — prize + stats reset consecutiveLosses + turnoverProgress
       await User.findOneAndUpdate(
         { telegramId: winnerId },
-        { $inc: { balance: winPrize, wins: 1, totalGames: 1 }, $set: { consecutiveLosses: 0 } }
+        { $inc: { balance: winPrize, wins: 1, totalGames: 1, turnoverProgress: betAmt },
+          $set: { consecutiveLosses: 0 } }
       );
+      // Loser — stats + consecutiveLosses + turnoverProgress
       if (loser) {
-        await User.findOneAndUpdate({telegramId:loser},{$inc:{losses:1,totalGames:1,consecutiveLosses:1}});
-        // Check rescue bonus for loser
+        await User.findOneAndUpdate(
+          { telegramId: loser },
+          { $inc: { losses: 1, totalGames: 1, consecutiveLosses: 1, turnoverProgress: betAmt } }
+        );
         await checkRescueBonus(loser);
       }
       // Commission for both players
       distribute3LevelCommission(winnerId).catch(()=>{});
       if (loser) distribute3LevelCommission(loser).catch(()=>{});
-    }
-    // ── Feature 1: Update turnover progress for all players ──
-    for (const pid of game.players) {
-      await User.findOneAndUpdate(
-        { telegramId: pid, turnoverTarget: { $gt: 0 } },
-        { $inc: { turnoverProgress: betAmt } }
-      ).catch(() => {});
     }
     await Game.findOneAndUpdate({gameId},{
       winner: winnerId, status:'completed', board:game.board,
