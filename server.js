@@ -35,11 +35,15 @@ const ENTRY_FEE = 500;
 const WIN_PRIZE = 800;
 const DRAW_REFUND = 400;
 
-// ── Feature 2: Multi-Tier Bet — dynamic prize calculation ──
+// ── Feature 2: Multi-Tier Bet — exact reward table ──
 const VALID_BETS = [500, 1000, 3000];
+const BET_TABLE = {
+  500:  { entryFee: 500,  winPrize: 800,  drawRefund: 450  },
+  1000: { entryFee: 1000, winPrize: 1700, drawRefund: 900  },
+  3000: { entryFee: 3000, winPrize: 5500, drawRefund: 2800 },
+};
 function getBetPrizes(bet) {
-  const b = VALID_BETS.includes(parseInt(bet)) ? parseInt(bet) : 500;
-  return { entryFee: b, winPrize: Math.floor(b * 1.6), drawRefund: Math.floor(b * 0.8) };
+  return BET_TABLE[parseInt(bet)] || BET_TABLE[500];
 }
 const L1_COMMISSION = 50;
 const L2_COMMISSION = 20;
@@ -541,8 +545,11 @@ async function endGameAI(gameId, winner, reason='normal') {
     if (winner === -1) {
       if (humanId) await User.findOneAndUpdate({telegramId:humanId},{$inc:{balance:drawRefund,totalGames:1}});
     } else if (winner === humanId) {
-      await User.findOneAndUpdate({telegramId:humanId},{$inc:{balance:winPrize,wins:1,totalGames:1},$set:{consecutiveLosses:0}});
-      await User.findOneAndUpdate({telegramId:humanId},{$set:{consecutiveLosses:0}});
+      // ✅ FIX: combined $inc + $set in one atomic update
+      await User.findOneAndUpdate(
+        { telegramId: humanId },
+        { $inc: { balance: winPrize, wins: 1, totalGames: 1 }, $set: { consecutiveLosses: 0 } }
+      );
     } else {
       if (humanId) {
         await User.findOneAndUpdate({telegramId:humanId},{$inc:{losses:1,totalGames:1,consecutiveLosses:1}});
@@ -677,9 +684,12 @@ async function checkRescueBonus(userId) {
   try {
     const u = await User.findOne({ telegramId: userId }).lean();
     if (!u) return;
-    if (u.consecutiveLosses >= 5) {
-      await User.findOneAndUpdate({ telegramId: userId },
-        { $inc: { balance: 200, consecutiveLosses: -5 } });
+    // ✅ FIX: exactly 5 consecutive losses triggers bonus (=== 5, not >= 5)
+    if (u.consecutiveLosses === 5) {
+      await User.findOneAndUpdate(
+        { telegramId: userId },
+        { $inc: { balance: 200 }, $set: { consecutiveLosses: 0 } }
+      );
       // Notify via Socket
       const sockId = userSockets.get(userId);
       if (sockId) {
@@ -688,7 +698,7 @@ async function checkRescueBonus(userId) {
       }
       // Notify via Bot
       if (bot) bot.telegram.sendMessage(userId,
-        `🛡️ <b>Rescue Bonus ရရှိပြီ!</b>\n\n5 ပွဲ ဆက်တိုက် ရှုံးသဖြင့် <b>200 MMK</b> Cashback ပေးအပ်ပါပြီ 🎁\n\nဆက်လက်ကြိုးစားပါ!`,
+        `🛡️ <b>Rescue Bonus ရရှိပြီ!</b>\n\n၅ ပွဲဆက်တိုက်ရှုံးသွားသဖြင့် Rescue Bonus <b>200 MMK</b> ပြန်ရရှိပါသည် 🎁\n\nဆက်လက်ကြိုးစားပါ 💪`,
         { parse_mode: 'HTML' }).catch(() => {});
     }
   } catch(e) { console.error('rescueBonus err:', e.message); }
@@ -1029,7 +1039,11 @@ async function sendFakeSearchNotification() {
   fakeGameIds.add(fakeGameId);
 
   const fakeName = randomAIName();
-  const displayName = obfuscateUsername(fakeName); // e.g., "Min..."
+  const displayName = obfuscateUsername(fakeName);
+
+  // ── Feature 3: Random bet from valid tiers ──
+  const fakeBet = VALID_BETS[Math.floor(Math.random() * VALID_BETS.length)];
+  const { winPrize: fakeWin } = getBetPrizes(fakeBet);
 
   // FIX 6c: Online-first + lastActive sort for fake notifications
   const allFakeUsers = await User.find({ isBanned: { $ne: true } }).select('telegramId lastActive').lean();
@@ -1040,7 +1054,7 @@ async function sendFakeSearchNotification() {
   const users = [...fakeOnline, ...fakeOffline];
   const sent = [];
   const CHUNK = 30;
-  const fakeMsgText = `⚡ <b>${displayName}</b> ပွဲရှာနေသည်!\n\n⏱ ${SEARCH_TIMEOUT_S} စက္ကန့်အတွင်း Join မနှိပ်ရင် ပွဲပျောက်မည်\n💰 ဝင်ကြေး: ${ENTRY_FEE.toLocaleString()} MMK  •  🏆 ဆု: ${WIN_PRIZE.toLocaleString()} MMK`;
+  const fakeMsgText = `⚡ <b>${displayName}</b> ပွဲရှာနေသည်!\n\n⏱ ${SEARCH_TIMEOUT_S} စက္ကန့်အတွင်း Join မနှိပ်ရင် ပွဲပျောက်မည်\n💰 ဝင်ကြေး: ${fakeBet.toLocaleString()} MMK  •  🏆 ဆု: ${fakeWin.toLocaleString()} MMK`;
   for (let i = 0; i < users.length; i += CHUNK) {
     const batch = users.slice(i, i + CHUNK);
     await Promise.allSettled(batch.map(async u => {
@@ -1131,9 +1145,11 @@ async function endGame(gameId, winner, reason='normal') {
       }
     } else if (winnerId) {
       const loser = game.players.find(p => Number(p) !== winnerId);
-      await User.findOneAndUpdate({telegramId:winnerId},{$inc:{balance:winPrize,wins:1,totalGames:1,$set:{consecutiveLosses:0}}});
-      // Reset consecutive losses for winner
-      await User.findOneAndUpdate({telegramId:winnerId},{$set:{consecutiveLosses:0}});
+      // ✅ FIX: $set must be at same level as $inc, never nested inside
+      await User.findOneAndUpdate(
+        { telegramId: winnerId },
+        { $inc: { balance: winPrize, wins: 1, totalGames: 1 }, $set: { consecutiveLosses: 0 } }
+      );
       if (loser) {
         await User.findOneAndUpdate({telegramId:loser},{$inc:{losses:1,totalGames:1,consecutiveLosses:1}});
         // Check rescue bonus for loser
@@ -1150,7 +1166,7 @@ async function endGame(gameId, winner, reason='normal') {
         { $inc: { turnoverProgress: betAmt } }
       ).catch(() => {});
     }
-    await Game.findOneAndUpdate({gameId},{\
+    await Game.findOneAndUpdate({gameId},{
       winner: winnerId, status:'completed', board:game.board,
       playerNames: game.playerNames,
       winnerName: winnerId===-1 ? 'draw' : (game.playerNames?.[winnerId] || String(winnerId)),
