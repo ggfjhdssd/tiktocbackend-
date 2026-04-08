@@ -722,6 +722,8 @@ async function applyFirstDepositBonus(userId, depositAmount) {
     }
   } catch(e) { console.error('firstDepositBonus err:', e.message); }
 }
+
+async function getSetting(key, def = null) {
   try { const s=await Settings.findOne({key}).lean(); return s?s.value:def; } catch { return def; }
 }
 async function setSetting(key,value) {
