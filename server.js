@@ -576,7 +576,12 @@ async function endGameAI(gameId, winner, reason='normal') {
       isAIGame: !!game.isAIGame
     },{upsert:true});
   } catch(e){ console.error('endGameAI err:', e); }
-  io.to(gameId).emit('gameOver', { winner, reason, board:game.board });
+  io.to(gameId).emit('gameOver', {
+    winner, reason, board: game.board,
+    betAmount: betAmt,
+    winPrize: getBetPrizes(betAmt).winPrize,
+    drawRefund: getBetPrizes(betAmt).drawRefund
+  });
   // FIX 4: Full memory cleanup for AI games
   activeGames.delete(gameId);
   clearTurnTimer(gameId);
@@ -722,8 +727,6 @@ async function applyFirstDepositBonus(userId, depositAmount) {
     }
   } catch(e) { console.error('firstDepositBonus err:', e.message); }
 }
-
-async function getSetting(key, def = null) {
   try { const s=await Settings.findOne({key}).lean(); return s?s.value:def; } catch { return def; }
 }
 async function setSetting(key,value) {
@@ -874,15 +877,21 @@ if (BOT_TOKEN) {
         await ctx.reply('ဦးစွာ /start နှိပ်ပါ').catch(()=>{});
         return;
       }
-      if (user.balance < ENTRY_FEE) {
+
+      // ── Dynamic bet: look up actual bet from waiting queue ──
+      const queueEntry = waitingQueue.find(w => w.gameId === gameId);
+      const joinBet = queueEntry?.betAmount || 500;
+      const { entryFee: joinFee, winPrize: joinWin } = getBetPrizes(joinBet);
+
+      if (user.balance < joinFee) {
         await ctx.reply(
-          `⚠️ ငွေမလုံလောက်ပါ!\n\nပွဲဝင်ကြေး: ${ENTRY_FEE.toLocaleString()} MMK\nသင့်ကျန်: ${user.balance.toLocaleString()} MMK`,
+          `⚠️ ငွေမလုံလောက်ပါ!\n\n💰 ဝင်ကြေး: ${joinFee.toLocaleString()} MMK\n🏦 သင့်ကျန်: ${user.balance.toLocaleString()} MMK`,
           Markup.inlineKeyboard([[Markup.button.webApp('💰 ငွေဖြည့်ရန်', FRONTEND_URL)]])
         ).catch(()=>{});
         return;
       }
       await ctx.reply(
-        '✅ ပွဲတွင် ဝင်ရောက်ရန် Join ကိုနှိပ်ပါ',
+        `✅ ပွဲဝင်ရန် Join ကိုနှိပ်ပါ\n💰 ဝင်ကြေး: ${joinFee.toLocaleString()} MMK  •  🏆 ဆု: ${joinWin.toLocaleString()} MMK`,
         Markup.inlineKeyboard([[Markup.button.webApp('🎮 JOIN NOW', `${FRONTEND_URL}/play.html?join=${gameId}`)]])
       ).catch(()=>{});
     } catch(e) { console.error('join action err:', e.stack || e); }
@@ -1096,11 +1105,15 @@ setInterval(async () => {
       if (game.isAIGame) {
         await endGameAI(gameId, -1, 'timeout');
       } else {
-        // Refund both players
+        // Refund both players with correct bet amount
         for (const pid of (game.players || [])) {
-          await User.findOneAndUpdate({telegramId:pid},{$inc:{balance:ENTRY_FEE}}).catch(()=>{});
+          const refAmt = getBetPrizes(game.betAmount || 500).entryFee;
+          await User.findOneAndUpdate({telegramId:pid},{$inc:{balance:refAmt}}).catch(()=>{});
         }
-        io.to(gameId).emit('gameOver', { winner: -1, reason: 'timeout', board: game.board });
+        io.to(gameId).emit('gameOver', { winner: -1, reason: 'timeout', board: game.board,
+          betAmount: game.betAmount || 500,
+          drawRefund: getBetPrizes(game.betAmount || 500).drawRefund
+        });
         activeGames.delete(gameId);
         clearTurnTimer(gameId);
         for (const pid of (game.players || [])) {
@@ -1179,7 +1192,12 @@ async function endGame(gameId, winner, reason='normal') {
     },{upsert:true});
   } catch(e){ console.error('endGame err:', e.stack || e); }
 
-  io.to(gameId).emit('gameOver',{winner:winnerId,reason,board:game.board});
+  io.to(gameId).emit('gameOver', {
+    winner: winnerId, reason, board: game.board,
+    betAmount: betAmt,
+    winPrize: getBetPrizes(betAmt).winPrize,
+    drawRefund: getBetPrizes(betAmt).drawRefund
+  });
   // FIX 4: Full memory cleanup
   activeGames.delete(gameId);
   clearTurnTimer(gameId);
@@ -1993,8 +2011,10 @@ app.post('/api/admin/withdrawals/:id/confirm', isAdmin, async(req,res)=>{
     if (!wd) return res.status(400).json({error:'Withdrawal မတွေ့ပါ သို့မဟုတ် ပြင်ဆင်ပြီးသားဖြစ်သည်'});
     const wdUser = await User.findOne({telegramId:wd.userId}).select('firstName username').lean();
     const displayName = wdUser?.firstName || wdUser?.username || `User${wd.userId}`;
-    // ── Feature 4: Global Payout Notification ──
-    io.emit('globalPayout', { name: displayName, amount: wd.amount });
+    const globalMsg = `🎉 အသုံးပြုသူ ${displayName} က ${wd.amount.toLocaleString()} MMK ထုတ်ယူမှု အောင်မြင်သွားပါပြီ!`;
+    // ── Global Payout Notification — both event names for compatibility ──
+    io.emit('globalPayout', { name: displayName, amount: wd.amount, message: globalMsg });
+    io.emit('globalNoti',   { message: globalMsg });
     if (bot) bot.telegram.sendMessage(wd.userId,
       `✅ ငွေ ${wd.amount.toLocaleString()} ကျပ် ထုတ်မှု အတည်ပြုပြီး!\n${wd.paymentMethod === 'wave' ? '🌊 Wave Pay' : '📱 KPay'}: ${wd.kpayNumber} 🎉`).catch(()=>{});
     res.json({success:true});
