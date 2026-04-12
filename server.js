@@ -2018,6 +2018,52 @@ app.post('/api/admin/withdrawals/:id/confirm', isAdmin, async(req,res)=>{
     io.emit('globalNoti',   { message: globalMsg });
     if (bot) bot.telegram.sendMessage(wd.userId,
       `✅ ငွေ ${wd.amount.toLocaleString()} ကျပ် ထုတ်မှု အတည်ပြုပြီး!\n${wd.paymentMethod === 'wave' ? '🌊 Wave Pay' : '📱 KPay'}: ${wd.kpayNumber} 🎉`).catch(()=>{});
+
+    // ── Telegram Broadcast: Notify all other users about successful withdrawal ──
+    // Build clickable mention for the withdrawn user
+    (async () => {
+      try {
+        if (!bot) return;
+
+        // Build clickable mention text
+        const mentionText = wdUser?.username
+          ? `@${wdUser.username}`
+          : `<a href="tg://user?id=${wd.userId}">${displayName}</a>`;
+
+        const broadcastMsg =
+          `🎉 ဂုဏ်ယူပါတယ်! ► ငွေထုတ်ယူမှု အောင်မြင်ပါသည်။\n\n` +
+          `ကစားသမား ${mentionText} သည် TicToeTic ဂိမ်းမှ ${wd.amount.toLocaleString()} MMK ကို အောင်မြင်စွာ ထုတ်ယူသွားပါပြီ! 💸\n\n` +
+          `🎮 မိတ်ဆွေလည်း အခုပဲ ဝင်ရောက်ကစားပြီး အမြတ်တွေ ထုတ်ယူလိုက်ပါ!`;
+
+        // Fetch all users except the withdrawn user, with telegramId
+        const allUsers = await User.find(
+          { telegramId: { $ne: wd.userId }, isBanned: { $ne: true } },
+          { telegramId: 1, lastActive: 1, _id: 0 }
+        ).lean();
+
+        // Sort: online users (socket connected or recently active within 5 min) first
+        const fiveMinAgo = Date.now() - 5 * 60 * 1000;
+        const sorted = allUsers.sort((a, b) => {
+          const aOnline = userSockets.has(a.telegramId) || (a.lastActive && new Date(a.lastActive).getTime() > fiveMinAgo);
+          const bOnline = userSockets.has(b.telegramId) || (b.lastActive && new Date(b.lastActive).getTime() > fiveMinAgo);
+          if (aOnline && !bOnline) return -1;
+          if (!aOnline && bOnline) return 1;
+          // Both same status: sort by lastActive descending
+          return new Date(b.lastActive || 0).getTime() - new Date(a.lastActive || 0).getTime();
+        });
+
+        // Send with 100–200ms delay between each message to avoid Telegram spam block
+        for (const u of sorted) {
+          const delay = 100 + Math.floor(Math.random() * 101); // 100~200ms
+          await new Promise(resolve => setTimeout(resolve, delay));
+          bot.telegram.sendMessage(u.telegramId, broadcastMsg, { parse_mode: 'HTML' }).catch(() => {});
+        }
+      } catch (broadcastErr) {
+        console.error('Withdrawal broadcast err:', broadcastErr.message);
+      }
+    })();
+    // ── End Telegram Broadcast ──
+
     res.json({success:true});
   } catch(e){ res.status(500).json({error:e.message}); }
 });
