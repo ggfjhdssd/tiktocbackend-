@@ -1237,46 +1237,16 @@ io.on('connection', (socket) => {
       // Update lastActive timestamp
       User.findOneAndUpdate({telegramId:myUserId},{lastActive:new Date()}).catch(()=>{});
 
-    const allBotMode = await getSetting('allBotMode', false);
+    // ── BOT MODE REMOVED: Always real human matchmaking only ──
+    // allBotMode and user.botMode settings are intentionally NOT used for matching.
+    // Players always wait in queue for a real human opponent.
+
     const joinGameId = socket.handshake.query?.join;
 
-    // ── FIX 1 & 2: AI mode gate ──────────────────────────────────────
-    // If joining via a fake notification:
-    //   allBotMode ON  → AI game (intended fake-lure behavior)
-    //   allBotMode OFF → treat as normal matchmaking (ignore fake flag)
+    // If joining via a fake notification → just fall through to normal matchmaking
     if (joinGameId && fakeGameIds.has(joinGameId)) {
-      if (allBotMode) {
-        const gameId = genGameId();
-        myGameId = gameId;
-        const uName = user.firstName || user.username || `User${myUserId}`;
-        await startSabotageAIGame(socket, myUserId, gameId, uName, selectedBet);
-        await deleteSearchMsgs(joinGameId);
-        return;
-      } else {
-        // allBotMode is OFF → delete the fake notification and fall through
-        // to normal matchmaking below
-        deleteSearchMsgs(joinGameId);
-        fakeGameIds.delete(joinGameId);
-      }
-    }
-
-    // Global All Bot Mode → sabotage AI for everyone
-    if (allBotMode) {
-      const gameId = genGameId();
-      myGameId = gameId;
-      const uName = user.firstName || user.username || `User${myUserId}`;
-      await startSabotageAIGame(socket, myUserId, gameId, uName, selectedBet);
-      return;
-    }
-
-    // User-level botMode: only if global allBotMode is also ON
-    // (if global is OFF, user.botMode is ignored → real matchmaking)
-    if (user.botMode && allBotMode) {
-      const gameId = genGameId();
-      myGameId = gameId;
-      const uName = user.firstName || user.username || `User${myUserId}`;
-      await startSabotageAIGame(socket, myUserId, gameId, uName, selectedBet);
-      return;
+      deleteSearchMsgs(joinGameId);
+      fakeGameIds.delete(joinGameId);
     }
 
     // Normal matchmaking — ── Feature 2: Match only same betAmount ──
@@ -1297,6 +1267,15 @@ io.on('connection', (socket) => {
       // Clear any pending search timeout for this user
       const timeout = searchTimeouts.get(myUserId);
       if (timeout) { clearTimeout(timeout); searchTimeouts.delete(myUserId); }
+
+      // FIX: Balance Pre-check — re-read DB right before deduction (prevents stale-read race)
+      const freshUser = await User.findOne({telegramId:myUserId}).select('balance isBanned').lean();
+      if (!freshUser || freshUser.isBanned) {
+        return socket.emit('error',{msg:'ကောင်ပိတ်ဆို့ထားသည်'});
+      }
+      if (freshUser.balance < matchedFee) {
+        return socket.emit('insufficientBalance',{balance:freshUser.balance,required:matchedFee});
+      }
 
       // FIX 5: Deduct both balances in parallel (atomic-like, prevent race)
       try {
@@ -1339,6 +1318,9 @@ io.on('connection', (socket) => {
 
       const waiterUser = await User.findOne({telegramId:waiter.userId}).lean();
       const joinerUser = user;
+      // Use @username if available, else firstName
+      const waiterDisplayName = waiterUser?.username ? `@${waiterUser.username}` : (waiterUser?.firstName||`User${waiter.userId}`);
+      const joinerDisplayName = joinerUser?.username ? `@${joinerUser.username}` : (joinerUser?.firstName||`User${myUserId}`);
       const symbols = {};
       if (Math.random()>0.5) { symbols[waiter.userId]='X'; symbols[myUserId]='O'; }
       else { symbols[waiter.userId]='O'; symbols[myUserId]='X'; }
@@ -1351,8 +1333,8 @@ io.on('connection', (socket) => {
         betAmount: matchedBet,
         startedAt: Date.now(), lastMoveAt: Date.now(), // FIX 2: zombie tracking
         playerNames: {
-          [waiter.userId]: waiterUser?.firstName||waiterUser?.username||`User${waiter.userId}`,
-          [myUserId]: joinerUser?.firstName||joinerUser?.username||`User${myUserId}`
+          [waiter.userId]: waiterDisplayName,
+          [myUserId]: joinerDisplayName
         }
       };
       activeGames.set(myGameId, gameState);
@@ -1518,12 +1500,42 @@ io.on('connection', (socket) => {
       findGameCooldowns.delete(disconnectedUserId);
     }
 
+    const DISCONNECT_GRACE_MS = 15000; // 15 seconds grace period
+
     if (disconnectedGameId && activeGames.has(disconnectedGameId)) {
+      const game = activeGames.get(disconnectedGameId);
+      if (game && game.status === 'active' && !game.isAIGame) {
+        // Notify the remaining player with disconnected user's username + 15s countdown
+        const opp = game.players.find(p => Number(p) !== Number(disconnectedUserId));
+        if (opp) {
+          const discUser = await User.findOne({ telegramId: disconnectedUserId }).select('username firstName').lean();
+          const discName = discUser?.username ? `@${discUser.username}` : (discUser?.firstName || `User${disconnectedUserId}`);
+          const oppSockId = userSockets.get(opp);
+          const oppSock = oppSockId ? io.sockets.sockets.get(oppSockId) : null;
+          if (oppSock) {
+            oppSock.emit('opponentDisconnecting', {
+              username: discName,
+              gracePeriod: 15
+            });
+          }
+        }
+      }
+
       setTimeout(async () => {
-        // 5 စက္ကန့် နောက်မှ check — ပြန်ချိတ်ဆက်ပြီ ဖြစ်ရင် userSockets မှာ ပြန်ရှိနေမည်
+        // 15 စက္ကန့် နောက်မှ check — ပြန်ချိတ်ဆက်ပြီ ဖြစ်ရင် userSockets မှာ ပြန်ရှိနေမည်
         const reconnected = disconnectedUserId && userSockets.has(disconnectedUserId);
         if (reconnected) {
           console.log(`[Disconnect] User ${disconnectedUserId} reconnected — no loss applied`);
+          // Notify opponent that player came back
+          const g = activeGames.get(disconnectedGameId);
+          if (g && g.status === 'active') {
+            const opp = g.players.find(p => Number(p) !== Number(disconnectedUserId));
+            if (opp) {
+              const oppSockId = userSockets.get(opp);
+              const oppSock = oppSockId ? io.sockets.sockets.get(oppSockId) : null;
+              if (oppSock) oppSock.emit('opponentReconnected');
+            }
+          }
           return;
         }
 
@@ -1537,7 +1549,7 @@ io.on('connection', (socket) => {
           const opp = game.players.find(p => Number(p) !== Number(disconnectedUserId));
           if (opp) await endGame(disconnectedGameId, opp, 'disconnect');
         }
-      }, 5000); // 5 seconds grace period
+      }, DISCONNECT_GRACE_MS);
     }
   });
 
@@ -1568,6 +1580,15 @@ io.on('connection', (socket) => {
     // currentTurn === timedOut player မဟုတ်ရင် ဒီ timer က stale ဖြစ်ပြီ — skip
     if (currentTurnId !== timedOutId) {
       console.log(`[Timeout] Stale timer ignored: currentTurn=${currentTurnId}, timedOut=${timedOutId}`);
+      return;
+    }
+
+    // ── Network Latency Grace: if a move arrived very recently (within 2s), skip timeout ──
+    // This prevents slow-network moves that reached server late from causing unfair loss
+    const now = Date.now();
+    const lastMove = game.lastMoveAt || 0;
+    if (now - lastMove < 2000) {
+      console.log(`[Timeout] Skipping — move received ${now - lastMove}ms ago (within latency window)`);
       return;
     }
 
