@@ -28,6 +28,14 @@ const io = new Server(server, {
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_ID = process.env.ADMIN_ID ? parseInt(process.env.ADMIN_ID) : null;
+// Extra admins — comma-separated telegram IDs in env: ADMIN_IDS=111,222,333
+const EXTRA_ADMIN_IDS = (process.env.ADMIN_IDS || process.env.PARTNER_IDS || '')
+  .split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
+// Full list of admins with complete control
+function isAnyAdmin(tid) {
+  const id = parseInt(tid);
+  return (ADMIN_ID && id === ADMIN_ID) || EXTRA_ADMIN_IDS.includes(id);
+}
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://tictokfrontend.vercel.app';
 const BACKEND_URL = process.env.BACKEND_URL || 'https://tiktocbackend-zktq.onrender.com';
 const BOT_USERNAME = process.env.BOT_USERNAME || 'tictoe1_bot';
@@ -383,7 +391,7 @@ if (BOT_TOKEN) {
       const id = ctx.from.id;
       const args = ctx.payload;
       const maint = await getSetting('maintenance', false);
-      if (maint && id !== ADMIN_ID) {
+      if (maint && !isAnyAdmin(id)) {
         try { await ctx.reply('🔧 ဆာဗာ ပြင်ဆင်နေသောကြောင့် ယာယီပိတ်ထားပါသည်။'); } catch (e) {}
         return;
       }
@@ -529,23 +537,23 @@ if (BOT_TOKEN) {
   async function adminPanelHandler(ctx) {
     try {
       const id = ctx.from.id;
-      console.log(`[/admin] from ${id} | isAdmin=${id===ADMIN_ID} | ADMIN_ID=${ADMIN_ID}`);
-      if (!ADMIN_ID || id !== ADMIN_ID) return; // not admin -> stay silent
+      console.log(`[/admin] from ${id} | isAdmin=${isAnyAdmin(id)} | ADMIN_ID=${ADMIN_ID} | EXTRA=[${EXTRA_ADMIN_IDS.join(',')}]`);
+      if (!isAnyAdmin(id)) return; // not admin -> stay silent
 
       let base = (FRONTEND_URL || '').trim().replace(/\/+$/,'');
       if (!/^https:\/\//i.test(base)) base = 'https://' + base.replace(/^https?:\/\//i,'');
       const adminUrl = `${base}/admin.html`;
 
       const kb = /^https:\/\//i.test(adminUrl)
-        ? Markup.inlineKeyboard([[Markup.button.webApp('🛠 Admin Panel သို့ဝင်ရန်', adminUrl)]])
-        : Markup.inlineKeyboard([[Markup.button.url('🛠 Admin Panel သို့ဝင်ရန်', adminUrl)]]);
+        ? Markup.inlineKeyboard([[Markup.button.webApp('🔓 Login To Admin Panel', adminUrl)]])
+        : Markup.inlineKeyboard([[Markup.button.url('🔓 Login To Admin Panel', adminUrl)]]);
 
       await ctx.reply(
-        `🔐 <b>Admin Panel</b>\n\nAdmin Dashboard သို့ ဝင်ရောက်ရန် အောက်ပါ Button ကို နှိပ်ပါ ↓`,
+        `🔐 <b>Admin Panel</b>\n\nLogin To Admin Panel`,
         { parse_mode: 'HTML', ...kb }
       ).catch(async (e) => {
         console.error('/admin reply err:', e.message, e.response?.description || '');
-        await ctx.reply(`🔐 Admin Panel:\n${adminUrl}`).catch(()=>{});
+        await ctx.reply(`🔐 Login To Admin Panel:\n${adminUrl}`).catch(()=>{});
       });
     } catch(e) { console.error('admin cmd err:', e.stack || e); }
   }
@@ -570,7 +578,7 @@ if (BOT_TOKEN) {
       { command:'agent', description:'🎯 Agent Panel' },
       { command:'admin', description:'🔐 Admin Panel' }
     ]).then(()=>console.log('✅ Commands registered')).catch(e=>console.error('setMyCommands err:',e.message));
-    console.log(`🔐 ADMIN_ID=${ADMIN_ID} | FRONTEND_URL=${FRONTEND_URL}`);
+    console.log(`🔐 ADMIN_ID=${ADMIN_ID} | EXTRA_ADMINS=[${EXTRA_ADMIN_IDS.join(',')}] | FRONTEND_URL=${FRONTEND_URL}`);
   }).catch(e=>console.error('Bot launch err:',e));
 }
 
@@ -1227,7 +1235,7 @@ io.on('connection', (socket) => {
 // ===== Admin Middleware =====
 function isAdmin(req,res,next) {
   const aid = parseInt(req.headers['x-admin-id']||req.query.adminId);
-  if (!aid||aid!==ADMIN_ID) return res.status(403).json({error:'Forbidden'});
+  if (!aid||!isAnyAdmin(aid)) return res.status(403).json({error:'Forbidden'});
   next();
 }
 
@@ -1257,7 +1265,7 @@ app.post('/api/auth', async(req,res) => {
     } else return res.status(401).json({error:'Auth required'});
 
     const maint = await getSetting('maintenance', false);
-    if (maint && tid !== ADMIN_ID) return res.status(503).json({error:'🔧 ဆာဗာ ပြင်ဆင်နေပါသည်'});
+    if (maint && !isAnyAdmin(tid)) return res.status(503).json({error:'🔧 ဆာဗာ ပြင်ဆင်နေပါသည်'});
 
     let user = await User.findOne({telegramId:tid});
     if (!user) {
@@ -1389,7 +1397,7 @@ app.post('/api/admin/verify', async(req,res) => {
     const {telegramId} = req.body;
     if (!telegramId) return res.status(400).json({error:'telegramId required'});
     const tid = parseInt(telegramId);
-    if (!ADMIN_ID||tid!==ADMIN_ID) return res.status(403).json({error:'Admin မဟုတ်ပါ'});
+    if (!isAnyAdmin(tid)) return res.status(403).json({error:'Admin မဟုတ်ပါ'});
     res.json({ok:true, adminId:tid});
   } catch(e){ res.status(500).json({error:'Server error'}); }
 });
@@ -2058,13 +2066,14 @@ app.get('/api/admin/agents/:tid', isAdmin, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ===== FIX #1: /api/admin/agent-referrals (alias of referrals/tree) =====
+// ===== FIX #1: /api/admin/agent-referrals (matches frontend field names) =====
 app.get('/api/admin/agent-referrals', isAdmin, async (req, res) => {
   try {
-    const agents = await User.find({ role: 'agent' }).select('telegramId firstName username referralCode').lean();
+    const agents = await User.find({ role: 'agent' }).select('telegramId firstName username referralCode balance').lean();
     const result = await Promise.all(agents.map(async (agent) => {
       const referredUsers = await User.find({ referredBy: agent.telegramId })
         .select('telegramId firstName username balance createdAt').lean();
+      const activeReferrals = referredUsers.filter(u => (u.balance || 0) > 0).length;
       const totalSalesAgg = referredUsers.length
         ? await Deposit.aggregate([
             { $match: { userId: { $in: referredUsers.map(u => u.telegramId) }, status: 'confirmed' } },
@@ -2075,8 +2084,11 @@ app.get('/api/admin/agent-referrals', isAdmin, async (req, res) => {
         agentId: agent.telegramId,
         agentName: agent.firstName || agent.username || `Agent${agent.telegramId}`,
         agentUsername: agent.username || '',
+        agentBalance: agent.balance || 0,
         referralCode: agent.referralCode,
         totalReferrals: referredUsers.length,
+        activeReferrals,
+        totalSales: totalSalesAgg[0]?.total || 0,
         totalDeposited: totalSalesAgg[0]?.total || 0,
         referrals: referredUsers.map(u => ({
           telegramId: u.telegramId,
