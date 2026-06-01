@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: tictoebackend2
+    name: tictocbackend
     env: node
     region: singapore
     plan: free
@@ -8,28 +8,18 @@ services:
     startCommand: node server.js
     envVars:
       - key: BOT_TOKEN
-        value: 8169341644:AAEuEOxOSAVvt2fRkO9DbzJJ_FhF2oSbt0k
+        sync: false
       - key: BOT_USERNAME
-        value: BamBamBoomm_bot
+        sync: false
       - key: ADMIN_ID
         sync: false
-      - key: PARTNER_IDS
+      - key: ADMIN_SECRET
         sync: false
-      - key: MONGODB_URI1
-        value: mongodb+srv://mongodb3_db_user:paingzin337885@cluster0.wlbyecu.mongodb.net/?appName=Cluster0
-      - key: MONGODB_URI2
+      - key: MONGODB_URI_1
         sync: false
-      - key: FRONTEND_URL
-        value: https://tictoefrontend2-iota.vercel.app
-      - key: BACKEND_URL
-        value: https://tictoebackend2.onrender.com
-      - key: ADMIN_KPAY_NUMBER
+      - key: MONGODB_URI_2
         sync: false
-      - key: ADMIN_KPAY_NAME
-        sync: false
-      - key: ADMIN_WAVE_NUMBER
-        sync: false
-      - key: ADMIN_WAVE_NAME
+      - key: APP_URL
         sync: false
       - key: PORT
         value: 3000
